@@ -94,6 +94,25 @@ until its criteria are met.
 - If a type mapping is ambiguous, flag it and ask — do not guess.
 - If the gateway requires encryption (AES, JWE, RSA, etc.), flag it and ask
   for guidance before implementing.
+- **Follow connector-service naming conventions, NOT euler-api-txns conventions.**
+  All proto field names, Rust struct field names, enum variants, function names,
+  and domain type names must match the patterns already established in
+  connector-service. Do NOT carry over Haskell/PureScript naming verbatim.
+  Before introducing ANY new field or type name:
+  1. Grep the existing `.proto` files in `crates/types-traits/grpc-api-types/proto/`
+     for the concept you need (e.g., phone, address, amount, status, token, etc.)
+  2. Grep existing Rust domain types in `crates/types-traits/domain_types/src/`
+  3. Use whatever name the codebase already uses for that concept
+  4. Only invent a new name if the concept is genuinely new to connector-service
+  Gateway-specific serialization names (e.g., `#[serde(rename = "mobileNumber")]`
+  for PhonePe's API) are fine — they match the external API contract, not our
+  internal naming.
+- **BEFORE EVERY COMMIT**, run both of these commands and fix any issues:
+  ```bash
+  cargo clippy --all-targets --all-features   # must pass with zero errors/warnings
+  cargo +nightly fmt --all                     # must produce no changes
+  ```
+  Do not commit code that fails clippy or is not formatted.
 - Commit nothing. Stage changes only. I will review before committing.
 ```
 

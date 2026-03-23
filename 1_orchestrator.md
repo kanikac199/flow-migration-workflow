@@ -99,6 +99,13 @@ If you already understand the architecture and just need to execute:
 
 **Output:** Gateway is live on connector-service behind a feature flag.
 
+> **MANDATORY PRE-COMMIT CHECK:** Before every commit, run:
+> ```bash
+> cargo clippy --all-targets --all-features   # zero errors/warnings
+> cargo +nightly fmt --all                     # zero formatting changes
+> ```
+> Do not commit code that fails clippy or is unformatted.
+
 ---
 
 ### Step 4: Test & Validate
