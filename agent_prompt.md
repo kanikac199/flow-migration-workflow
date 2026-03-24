@@ -25,9 +25,8 @@ BATCH ORCHESTRATOR (you — the main agent)
   ├─► Per-Flow Orchestrator: Flow 1 (VerifyVpa / Razorpay)
   │     │
   │     ├─► S1 Analysis ────────────────────────────────────────────┐
-  │     │     ├─► S1.1 Search euler-api-txns (explore)  ─┐          │
-  │     │     ├─► S1.2 Search euler-api-gateway (explore) ├ PARALLEL │
-  │     │     ├─► S1.3 Search connector-service (explore) ┘          │
+  │     │     ├─► S1.1 Search euler-api-txns (explore)    ─┐        │
+  │     │     ├─► S1.2 Search connector-service (explore)  ┘ PARALLEL│
   │     │     └─► S1 merges results → ANALYSIS REPORT               │
   │     │                                                           │
   │     ├─► S2 Core Flow Infra ─────────────────────────────────────┤
@@ -110,10 +109,9 @@ Task(description="S5 Push & PR: VerifyVpa", subagent_type="general", prompt="...
 
 ```
 # Inside S1:
-Task(description="S1.1 euler-api-txns", subagent_type="explore", prompt="...")  ─┐
-Task(description="S1.2 euler-api-gateway", subagent_type="explore", prompt="...") ├ PARALLEL
-Task(description="S1.3 connector-service", subagent_type="explore", prompt="...") ┘
-# S1 merges all 3 results into ANALYSIS REPORT
+Task(description="S1.1 euler-api-txns", subagent_type="explore", prompt="...")    ─┐
+Task(description="S1.2 connector-service", subagent_type="explore", prompt="...") ─┘ PARALLEL
+# S1 merges both results into ANALYSIS REPORT
 ```
 
 ---
@@ -222,7 +220,6 @@ pipeline. Each stage is a subagent you spawn via the Task tool.
 
 ## Repos
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
 - connector-service: /home/kanikachaudhary/Kanika/connector-service/
 - Credentials: /home/kanikachaudhary/Kanika/creds.json
 - Workflow docs: /home/kanikachaudhary/Kanika/flow-migration-workflow/
@@ -247,7 +244,7 @@ by spawning 3 PARALLEL `explore` sub-subagents, then merging results.
 
 Analyze the {{FLOW_NAME}} flow for migration to connector-service.
 
-You must spawn 3 PARALLEL explore sub-subagents to search independently:
+You must spawn 2 PARALLEL explore sub-subagents to search independently:
 
 **S1.1 — Search euler-api-txns** (explore, PARALLEL):
 - Repo: /home/kanikachaudhary/Kanika/euler-api-txns/
@@ -259,35 +256,27 @@ You must spawn 3 PARALLEL explore sub-subagents to search independently:
   encoding, special handling
 - Also check Endpoints.hs / Env.hs for base URLs
 
-**S1.2 — Search euler-api-gateway** (explore, PARALLEL):
-- Repo: /Users/kanika.c/code/workflow/euler-api-gateway/
-- Search gateway/src/Euler/API/Gateway/Gateway/ for implementations of
-  {{FLOW_NAME}} (some gateways like PINELABS_ONLINE, KOTAK_BIZ, CRED,
-  SODEXO, YES_BIZ exist here but NOT in euler-api-txns)
-- For each gateway found, document same details as S1.1
-- Check Routes.hs for endpoint URLs
-
-**S1.3 — Search connector-service** (explore, PARALLEL):
+**S1.2 — Search connector-service** (explore, PARALLEL):
 - Repo: /home/kanikachaudhary/Kanika/connector-service/
 - Check crates/types-traits/domain_types/src/connector_flow.rs for existing
   flow marker struct matching {{FLOW_NAME}}
 - Check crates/types-traits/interfaces/src/connector_types.rs for sub-trait
 - Check crates/types-traits/grpc-api-types/proto/services.proto for RPC
-- For each Haskell field name found by S1.1/S1.2, grep existing .proto files
+- For each Haskell field name found by S1.1, grep existing .proto files
   and Rust domain types to find connector-service's name for that concept
 - Check if {{CONNECTOR_NAME}} has any existing implementation (real or stub)
   for this flow
 
-After all 3 sub-subagents return, MERGE their results into a single
+After both sub-subagents return, MERGE their results into a single
 ANALYSIS REPORT with these exact sections:
 
 - **Flow:** name
-- **Connectors that implement this flow:** [list from S1.1 + S1.2]
-- **Flow type exists in connector-service:** YES/NO (from S1.3)
-- **Per-Connector Analysis:** (from S1.1 + S1.2, for each connector)
+- **Connectors that implement this flow:** [list from S1.1]
+- **Flow type exists in connector-service:** YES/NO (from S1.2)
+- **Per-Connector Analysis:** (from S1.1, for each connector)
   - Haskell file, function, endpoint, auth, request/response fields, special handling
-- **Field Naming Map:** Haskell name → connector-service name (from S1.3)
-- **Flow Infrastructure Needed:** if flow type doesn't exist (from S1.3)
+- **Field Naming Map:** Haskell name → connector-service name (from S1.2)
+- **Flow Infrastructure Needed:** if flow type doesn't exist (from S1.2)
   - Flow marker struct, sub-trait, proto RPC, request/response messages
 - **Pre-call Dependency Chain:** trace what inputs this flow needs (IDs,
   tokens) and which prior flows produce them. For each dependency, state
@@ -365,15 +354,14 @@ First, spawn PARALLEL `explore` sub-subagents to read source code:
 **S3.1 — Read Haskell sources for pre-call flows** (explore, PARALLEL):
 (Skip if no pre-call dependencies in the Analysis Report)
 - For each pre-call flow in the dependency chain, read the Haskell
-  implementation in euler-api-txns or euler-api-gateway for {{CONNECTOR_NAME}}
+  implementation in euler-api-txns for {{CONNECTOR_NAME}}
 - Document: endpoint URL, request construction, response parsing, auth,
   headers, encoding
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
 
 **S3.2 — Read Haskell sources for target flow** (explore, PARALLEL):
 - Read the {{CONNECTOR_NAME}} implementation of {{FLOW_NAME}} in
-  euler-api-txns or euler-api-gateway
+  euler-api-txns
 - Document: endpoint URL, request construction (every field, how it's built),
   response parsing (every field, how status is determined), auth headers,
   checksum/signature algorithm, encoding, error handling
@@ -712,12 +700,11 @@ You are S1 — the Analysis Agent for a flow migration.
 
 ## Repos
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
 - connector-service: /home/kanikachaudhary/Kanika/connector-service/
 
 ## Your Job
 
-Analyze {{FLOW_NAME}} across all 3 repos by spawning 3 PARALLEL `explore`
+Analyze {{FLOW_NAME}} across both repos by spawning 2 PARALLEL `explore`
 sub-subagents, then merge their results into a single ANALYSIS REPORT.
 
 You do NOT write code. You only read, search, and analyze.
@@ -760,30 +747,9 @@ Return ALL findings as structured text. Include file:line references.
 
 ---
 
-### Sub-subagent S1.2 — Search euler-api-gateway (explore, PARALLEL)
+### Sub-subagent S1.2 — Search connector-service (explore, PARALLEL)
 
-Spawn with: Task(description="S1.2 euler-api-gateway: {{FLOW_NAME}}", subagent_type="explore", prompt=<below>)
-
-Search /Users/kanika.c/code/workflow/euler-api-gateway/ for implementations
-of {{FLOW_NAME}}.
-
-Some gateways exist ONLY in this repo (not in euler-api-txns):
-PINELABS_ONLINE, KOTAK_BIZ, CRED, SODEXO, YES_BIZ.
-
-1. Search gateway/src/Euler/API/Gateway/Gateway/ for {{FLOW_NAME}} (try
-   camelCase, PascalCase, snake_case, and partial matches).
-2. For each gateway found, document the same table as S1.1 (function, file,
-   line, endpoint, auth, request/response fields, special handling).
-3. Check Routes.hs and Config modules for endpoint URLs.
-
-Return ALL findings as structured text. Include file:line references.
-If nothing found, return "No implementations found in euler-api-gateway."
-
----
-
-### Sub-subagent S1.3 — Search connector-service (explore, PARALLEL)
-
-Spawn with: Task(description="S1.3 connector-service: {{FLOW_NAME}}", subagent_type="explore", prompt=<below>)
+Spawn with: Task(description="S1.2 connector-service: {{FLOW_NAME}}", subagent_type="explore", prompt=<below>)
 
 Search /home/kanikachaudhary/Kanika/connector-service/ for existing
 infrastructure related to {{FLOW_NAME}}:
@@ -807,7 +773,7 @@ infrastructure related to {{FLOW_NAME}}:
    STUB (empty impl block) / MISSING.
 
 6. **Field naming map:** For each Haskell request/response field name that
-   S1.1/S1.2 would find (common ones: mobile_number, merchant_id, otp,
+   S1.1 would find (common ones: mobile_number, merchant_id, otp,
    token, amount, currency, vpa, mandate_id, subscription_id, etc.),
    grep existing .proto files and Rust domain types to find what
    connector-service calls that concept. Build a mapping table:
@@ -825,7 +791,7 @@ Return ALL findings as structured text.
 
 ---
 
-### After all 3 return, MERGE into ANALYSIS REPORT:
+### After both return, MERGE into ANALYSIS REPORT:
 
 You MUST produce this exact structure:
 
@@ -834,19 +800,19 @@ You MUST produce this exact structure:
 **Flow:** {{FLOW_NAME}}
 
 **Connectors that implement this flow in Haskell:**
-| # | Gateway | Repo | File | Function | Line |
-|---|---------|------|------|----------|------|
-(from S1.1 + S1.2)
+| # | Gateway | File | Function | Line |
+|---|---------|------|----------|------|
+(from S1.1)
 
 **Flow type exists in connector-service:** YES / NO
-(from S1.3 — marker struct, sub-trait, proto RPC all exist = YES)
+(from S1.2 — marker struct, sub-trait, proto RPC all exist = YES)
 
 **Per-Connector Analysis:**
 
-For each connector found in S1.1/S1.2:
+For each connector found in S1.1:
 
 #### <ConnectorName>
-- **Source:** euler-api-txns / euler-api-gateway
+- **Source:** euler-api-txns
 - **File:** <path>:<line>
 - **Function:** <name>
 - **Endpoint:** <method> <url>
@@ -862,12 +828,12 @@ For each connector found in S1.1/S1.2:
 - **Special Handling:** <checksums, signatures, retries, etc.>
 
 **Field Naming Map (Haskell → connector-service):**
-(from S1.3)
+(from S1.2)
 | Haskell Name | connector-service Name | Found In |
 |---|---|---|
 
 **Flow Infrastructure Needed:**
-(from S1.3 — only if flow type does NOT exist)
+(from S1.2 — only if flow type does NOT exist)
 - [ ] Flow marker struct in connector_flow.rs
 - [ ] Domain request/response types in connector_types.rs
 - [ ] Sub-trait in interfaces/connector_types.rs
@@ -1161,8 +1127,6 @@ Pre-call chain from Analysis Report:
 For each pre-call flow, find the {{CONNECTOR_NAME}} implementation in:
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
   Path: euler-x/src-generated/Gateway/<GatewayName>/Flow.hs
-- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
-  Path: gateway/src/Euler/API/Gateway/Gateway/<GatewayName>/
 
 For each pre-call flow, document:
 | Field | Value |
@@ -1191,8 +1155,6 @@ Read the {{CONNECTOR_NAME}} implementation of {{FLOW_NAME}} in Haskell.
 Search in:
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
   Path: euler-x/src-generated/Gateway/<GatewayName>/Flow.hs
-- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
-  Path: gateway/src/Euler/API/Gateway/Gateway/<GatewayName>/
 
 Find the implementation function and document EVERYTHING:
 
