@@ -1,1069 +1,627 @@
-# Agent Prompt: Flow Migration Orchestrator
+# Agent Prompt: Batch Flow Migration Orchestrator
 
-> **This is the entry point for migrating a flow from euler-api-txns to connector-service.**
+> **This is the entry point for migrating one or more flows from euler-api-txns
+> to connector-service.**
 >
-> You (the main agent) act as an **orchestrator**. You do NOT implement code yourself.
-> Instead, you spawn subagents for each phase and pass structured handoffs between them.
+> You (the main agent) act as a **Batch Orchestrator**. You do NOT implement code
+> yourself and you do NOT directly spawn pipeline subagents (S1-S5).
+> Instead, you spawn **one Per-Flow Orchestrator subagent per flow**, sequentially.
+> Each Per-Flow Orchestrator internally manages its own 5-stage pipeline
+> (S1 Analysis → S2 Core Flow → S3 Connector → S4 Testing → S5 Push & PR),
+> and each stage further decomposes into parallel sub-subagents where possible.
 
 ---
 
-## Orchestrator Behavior
-
-When you receive a flow migration request:
-
-1. Read this file (`agent_prompt.md`) to understand the subagent pipeline.
-2. Read `1_orchestrator.md` to understand the overall workflow structure.
-3. **When spawning each subagent, include its full prompt template from this file
-   as the subagent's context.** Each subagent section below contains a "Prompt
-   Template" — copy the appropriate template and fill in the `{{PLACEHOLDERS}}`
-   with the handoff data from the previous subagent. The subagent needs this
-   context to know what to do.
-4. Execute **Subagent 1 → 2 → 3 → 4 → 5** in order, passing the handoff data between them.
-5. If any subagent fails or needs user input, surface it to the user immediately.
-6. Do NOT proceed to the next subagent until the current one completes successfully.
-7. **One branch per flow (with dependency exception).** If the user requests multiple
-   flows, run the full pipeline **separately for each flow**. Each flow gets its own
-   fresh branch from `main`. Exception: pre-call dependency flows required for testing
-   the target flow go on the SAME branch — they are prerequisites, not independent features.
-8. **Retry loop on failure.** If Subagent 4 (Testing) returns FAIL:
-   - Re-spawn Subagent 3 (Connector Integration) with the error details to fix the code
-   - Re-spawn Subagent 4 (Testing) to retest
-   - Repeat until HTTP 200 is received
-9. **Connector fallback on capability mismatch.** If Subagent 4 returns
-   CAPABILITY_MISMATCH, pick the next connector from the analysis report's
-   connector list, re-spawn Subagent 3 for the new connector, then Subagent 4.
-   Subagent 2 (Core Flow) is NOT re-run — the flow type already exists.
-10. **Never stop at partial results.** The pipeline is NOT complete until a
-    connector returns HTTP 200 with valid business data, or ALL connectors from
-    the analysis report have been exhausted (escalate to user with evidence).
-
----
-
-## Subagent Pipeline
+## Architecture Overview
 
 ```
-User: "Migrate the VerifyOtpForWallet flow"
+USER: "Migrate these 12 flows: VerifyVpa, ResendOtpForWallet, ..."
   │
   ▼
-┌──────────────────────────────────────┐
-│  Subagent 1: ANALYSIS (explore)      │
-│  - Find connectors in euler-api-txns │
-│  - Analyze Haskell code              │
-│  - Identify pre-call dependencies    │
-│  - Check connector capability        │
-│  - Identify fallback connector       │
-│  - Check if flow type exists in CS   │
-└──────────────┬───────────────────────┘
-               │ Handoff: Analysis Report
-               ▼
-┌──────────────────────────────────────┐
-│  Subagent 2: CORE FLOW (general)    │
-│  - Create FRESH branch from main    │
-│  - Flow marker, domain types,       │
-│    sub-trait, proto, conversions,    │
-│    gRPC handler, default impls      │
-│  - Also for pre-call flow types     │
-│    if they don't exist              │
-│  - clippy + fmt + build             │
-│  (Skip if flow type already exists) │
-└──────────────┬───────────────────────┘
-               │ Handoff: Core Flow Report
-               ▼
-┌──────────────────────────────────────┐
-│  Subagent 3: CONNECTOR (general)    │◄────────────────────┐
-│  - Connector-specific transformers, │                     │
-│    URL, headers, auth, error        │                     │
-│  - Pre-call connector impls too     │                     │
-│  - clippy + fmt + build             │  Retry on FAIL or   │
-└──────────────┬───────────────────────┘  CAPABILITY_MISMATCH│
-               │ Handoff: Connector Report                   │
-               ▼                                             │
-┌──────────────────────────────────────┐                     │
-│  Subagent 4: TESTING (general)      │                     │
-│  - Execute pre-call chain via grpcurl│                     │
-│  - Feed outputs into target flow    │                     │
-│  - MUST get HTTP 200                │                     │
-│  - On FAIL → back to Subagent 3    │─────────────────────►│
-│  - On CAPABILITY_MISMATCH →         │                     │
-│    orchestrator picks next connector │─────────────────────┘
-└──────────────┬───────────────────────┘
-               │ Handoff: Test Report (PASS)
-               ▼
-┌──────────────────────────────────────┐
-│  Subagent 5: PUSH & PR              │
-│  - Revert test-only config          │
-│  - Push branch (commits already     │
-│    done by S2 and S3)               │
-│  - Raise PR with full test evidence │
-└──────────────┬───────────────────────┘
-               │
-               ▼
-         Return PR URL to user
+BATCH ORCHESTRATOR (you — the main agent)
+  │
+  │  Spawns Per-Flow Orchestrators SEQUENTIALLY:
+  │
+  ├─► Per-Flow Orchestrator: Flow 1 (VerifyVpa / Razorpay)
+  │     │
+  │     ├─► S1 Analysis ────────────────────────────────────────────┐
+  │     │     ├─► S1.1 Search euler-api-txns (explore)  ─┐          │
+  │     │     ├─► S1.2 Search euler-api-gateway (explore) ├ PARALLEL │
+  │     │     ├─► S1.3 Search connector-service (explore) ┘          │
+  │     │     └─► S1 merges results → ANALYSIS REPORT               │
+  │     │                                                           │
+  │     ├─► S2 Core Flow Infra ─────────────────────────────────────┤
+  │     │     ├─► S2.1 Read workflow docs (explore) ─┐               │
+  │     │     │   (7-layer guide, type mapping, etc.) ├ PARALLEL     │
+  │     │     ├─► S2.2 Read file references (explore) ┘              │
+  │     │     └─► S2.3 Implement 7 layers + build + commit (general) │
+  │     │                                                           │
+  │     ├─► S3 Connector Integration ───────────────────────────────┤
+  │     │     ├─► S3.1 Read Haskell sources: pre-calls (explore) ─┐  │
+  │     │     ├─► S3.2 Read Haskell sources: target (explore)     ├ P │
+  │     │     ├─► S3.3 Read existing connector code (explore)     ┘  │
+  │     │     └─► S3.4 Implement + build + commit (general)          │
+  │     │                                              ↕ retry S3↔S4 │
+  │     ├─► S4 Testing (general) ───────────────────────────────────┤
+  │     │     Build → start server → pre-call chain → test → eval   │
+  │     │                                                           │
+  │     └─► S5 Push & PR (general) ─────────────────────────────────┘
+  │         Revert config → clippy/fmt → push → gh pr create
+  │
+  │   ◄── Returns: PR URL or escalation
+  │   Report Flow 1 result to user
+  │
+  ├─► Per-Flow Orchestrator: Flow 2 (ResendOtpForWallet / Razorpay)
+  │     └─► S1 → S2 → S3 ↔ S4 → S5  (same nested structure)
+  │
+  ├─► ... Flow 3 through Flow N (sequentially)
+  │
+  ▼
+  Report final batch summary to user
 ```
 
-### Orchestrator Retry Flow
+### Design principles
+
+1. **Task descriptions, not templates.** The Per-Flow Orchestrator tells each
+   subagent WHAT to accomplish. Subagents read workflow docs themselves and
+   decide HOW to accomplish it.
+
+2. **Maximum parallelism within stages.** Independent reads (3 repos, workflow
+   docs, Haskell sources) run as parallel sub-subagents. Dependent work
+   (implementation, testing) runs sequentially.
+
+3. **Sequential between flows.** Later flows may depend on infrastructure from
+   earlier flows, and only one gRPC server can run at a time.
+
+4. **Clean boundaries.** Each agent returns a structured report. The parent
+   agent merges or passes it to the next stage.
+
+---
+
+## CRITICAL: How Subagents Are Spawned
+
+**Every agent at every level MUST be invoked using the Task tool.**
+
+### Level 1: Batch Orchestrator → Per-Flow Orchestrators (sequential)
 
 ```
-         S1 (Analysis)
-              │
-              ▼
-         S2 (Core Flow Infra)   ← runs once, unless new flow types needed
-              │
-              ▼
-    ┌──► S3 (Connector Integration) ◄──────────────────┐
-    │         │                                         │
-    │         ▼                                         │
-    │    S4 (Testing)                                   │
-    │         │                                         │
-    │         ├── PASS (200) ──► S5 (Push & PR)          │
-    │         │                                         │
-    │         ├── FAIL (code bug) ─────────────────────►│
-    │         │   (pass error details to S3 for fix)    │
-    │         │                                         │
-    │         └── CAPABILITY_MISMATCH ──► Orchestrator  │
-    │              picks next connector ───────────────►│
-    │              (S3 for new connector)               │
-    │                                                   │
-    └── repeat until 200 or all connectors exhausted ──►│
+Task(description="Flow 1/12: VerifyVpa", subagent_type="general", prompt="...")
+# wait for result
+Task(description="Flow 2/12: ResendOtpForWallet", subagent_type="general", prompt="...")
+# wait for result
+...
+```
+
+### Level 2: Per-Flow Orchestrator → S1-S5 (sequential stages)
+
+```
+Task(description="S1 Analysis: VerifyVpa", subagent_type="general", prompt="...")
+# wait, extract ANALYSIS REPORT
+Task(description="S2 Core Flow: VerifyVpa", subagent_type="general", prompt="...")
+# wait, extract CORE FLOW REPORT
+Task(description="S3 Connector: VerifyVpa/Razorpay", subagent_type="general", prompt="...")
+# wait, extract CONNECTOR REPORT
+Task(description="S4 Testing: VerifyVpa/Razorpay", subagent_type="general", prompt="...")
+# wait, extract TEST REPORT → retry S3↔S4 if needed
+Task(description="S5 Push & PR: VerifyVpa", subagent_type="general", prompt="...")
+```
+
+### Level 3: S1/S2/S3 → parallel sub-subagents (independent reads)
+
+```
+# Inside S1:
+Task(description="S1.1 euler-api-txns", subagent_type="explore", prompt="...")  ─┐
+Task(description="S1.2 euler-api-gateway", subagent_type="explore", prompt="...") ├ PARALLEL
+Task(description="S1.3 connector-service", subagent_type="explore", prompt="...") ┘
+# S1 merges all 3 results into ANALYSIS REPORT
 ```
 
 ---
 
-## Subagent 1: Analysis
+## Batch Orchestrator Behavior
 
-**Type:** `explore`
+### What you do:
+1. Parse the migration plan (list of flows, connectors, branch names)
+2. For each flow, spawn a Per-Flow Orchestrator via Task tool
+3. Wait for it to complete — it returns a PR URL or an escalation
+4. Report the result to the user
+5. Move to the next flow
+6. After all flows, report batch summary
 
-**Purpose:** Discover which connectors implement the requested flow in euler-api-txns,
-analyze the Haskell implementation, identify pre-call dependencies, check connector
-capabilities, and determine whether the flow type already exists in connector-service.
+### What you do NOT do:
+- Read source code, run cargo/git/grpcurl, edit files
+- Spawn S1/S2/S3/S4/S5 directly — the Per-Flow Orchestrator does that
+- Handle S3↔S4 retry logic — the Per-Flow Orchestrator handles that
 
-### Prompt Template
+### Pseudocode
 
 ```
-You are analyzing a flow migration from euler-api-txns (Haskell) to connector-service (Rust).
+for i, (flow, connector, branch) in enumerate(migration_plan):
+    result = Task(
+        description=f"Flow {i+1}/{len(migration_plan)}: {flow}",
+        subagent_type="general",
+        prompt=build_per_flow_prompt(flow, connector, branch, i+1, len(migration_plan))
+    )
 
-## Target Flow: {{FLOW_NAME}}
+    if result.status == "SUCCESS":
+        report(f"Flow {i+1} ({flow}): PR at {result.pr_url}")
+    elif result.status == "ESCALATION":
+        report(f"Flow {i+1} ({flow}): ESCALATION — {result.reason}")
+        ask_user("Continue with next flow or stop?")
 
-## Repos
-- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-- connector-service: /home/kanikachaudhary/Kanika/connector-service/
-
-## Workflow Docs
-- Architecture comparison: /home/kanikachaudhary/Kanika/flow-migration-workflow/2_overview/2.2_architecture_comparison.md
-- Flow inventory: /home/kanikachaudhary/Kanika/flow-migration-workflow/3_planning/3.1_flow_inventory.md
-- Per-flow mapping: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
-- New flow type guide: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
-- Code pattern translation: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
-
-## Tasks
-
-1. **Find which connectors implement this flow in euler-api-txns.**
-   - Search euler-x/src-generated/Gateway/ for functions matching {{FLOW_NAME}}
-     (e.g., grep for "triggerOTP", "verifyOTP", "checkBalance", etc.)
-   - Search euler-x/src-generated/Gateway/CommonGateway.hs for the dispatcher
-     that routes to per-gateway implementations
-   - List every gateway that has an implementation
-
-2. **Analyze the Haskell implementation for each gateway found.**
-   For each gateway, read the implementation and document:
-   - File path and line numbers (e.g., Gateway/PhonePe/Flow.hs:3194)
-   - Function name and signature
-   - Request type: all fields, their types, which are required vs optional
-   - Response type: success shape, failure shape, all fields
-   - API endpoint URL (and which base URL / domain it uses)
-   - Authentication method (headers, signature, checksum algorithm)
-   - Any encoding (Base64, JSON, form-encoded, XML)
-   - Any special handling (caching, retries, error mapping)
-
-3. **Check if the flow type already exists in connector-service.**
-   - Read connector-service crates/types-traits/domain_types/src/connector_flow.rs
-     for flow marker structs
-   - Read crates/types-traits/interfaces/src/connector_types.rs for sub-traits
-   - Read crates/types-traits/grpc-api-types/proto/services.proto for existing RPCs
-   - State clearly: "Flow type exists: YES/NO"
-   - If YES, list the existing marker struct, sub-trait, and RPC name
-   - If NO, state what needs to be created (referencing 4.5_new_flow_type.md)
-
-4. **Check naming conventions.**
-   - For every field in the Haskell request/response types, grep the existing
-     connector-service .proto files and Rust types to find what connector-service
-     calls that concept
-   - Example: Haskell uses "mobileNumber" → connector-service uses "phone_number"
-   - Produce a field mapping table: Haskell name → connector-service name
-
-5. **Identify pre-call dependencies.**
-   - Trace the flow's requirements: does it need inputs (IDs, tokens, auth tokens)
-     produced by a prior flow?
-     Examples: status-check flows need the entity created by a setup flow;
-     wallet debit needs an auth token from OTP verification; sync flows need
-     a transaction to have been initiated.
-   - For each dependency, identify:
-     - Which flow produces the required input
-     - Whether that flow exists in connector-service for this connector
-       (real implementation vs empty stub vs doesn't exist at all)
-     - If missing or stub: it must be implemented as a pre-call
-   - Build a dependency chain: list flows in execution order needed to get a
-     200 from the target flow in test.
-
-6. **Validate connector capability for testing.**
-   - Check the connector's test/sandbox environment: does it support this flow?
-   - Look for known limitations (production-only features, bank approval required,
-     recurring not enabled in test mode)
-   - Check the Haskell code for test-mode branching or feature flags
-   - If the primary connector is likely unsupported in test, identify a fallback
-     connector from the list that CAN test this flow
-
-## Return Format
-
-Return a structured analysis report with these exact sections:
-
-### ANALYSIS REPORT
-
-**Flow:** {{FLOW_NAME}}
-**Connectors that implement this flow:** [list]
-**Flow type exists in connector-service:** YES/NO
-
-**Per-Connector Analysis:**
-(for each connector)
-- Haskell file: <path>:<lines>
-- Function: <name>
-- Endpoint: <URL>
-- Auth method: <type>
-- Request fields: [field: type (required/optional)]
-- Response fields (success): [field: type]
-- Response fields (failure): [field: type]
-- Special handling: [notes]
-
-**Field Naming Map:**
-| Haskell name | connector-service name | Source |
-|...|...|...|
-
-**Flow Infrastructure Needed:** (if flow type doesn't exist)
-- Flow marker struct: <name>
-- Sub-trait: <name>
-- Proto RPC: <name>
-- Request message: <name>
-- Response message: <name>
-
-**Pre-call Dependency Chain:**
-| Order | Flow | Exists in connector-service? | Produces |
-|-------|------|------------------------------|----------|
-| 1 | <pre-call flow> | YES (real) / YES (stub) / NO | <output IDs/tokens> |
-| 2 | <target flow> | ... | ... |
-(or "None — flow has no pre-call dependencies")
-
-**Connector Capability for Testing:**
-- Primary connector: <name> — SUPPORTED / LIKELY UNSUPPORTED (reason: ...)
-- Fallback connector: <name> or "N/A — all connectors have same limitation"
+report_batch_summary()
 ```
 
-### Handoff → Subagent 2
+### Batch Summary Format
 
-Pass the full analysis report as context to Subagent 2.
+```
+### Batch Migration Summary
+
+| # | Flow | Connector | Branch | Status | PR |
+|---|------|-----------|--------|--------|----|
+| 1 | VerifyVpa | Razorpay | feat/razorpay-verify-vpa | SUCCESS | #NNN |
+| 2 | ResendOtp | Razorpay | feat/razorpay-resend-otp | SUCCESS | #NNN |
+| 3 | ... | ... | ... | ESCALATION | — |
+
+**Completed:** X/N flows
+**Escalations:** Y flows
+```
 
 ---
 
-## Subagent 2: Core Flow Infrastructure
+## Per-Flow Orchestrator
 
+**Spawned by:** Batch Orchestrator
 **Type:** `general`
 
-**Purpose:** Create the flow type infrastructure in connector-service — all 7 layers
-(flow marker, domain types, sub-trait, proto messages, proto-to-domain conversions,
-gRPC handler, default implementations). Also creates flow types for any pre-call
-dependencies that don't exist yet. This subagent does NOT write connector-specific code.
+### What it receives:
+- Flow name, connector, branch name
+- Flow number and total count
 
-If the flow type already exists in connector-service (per the analysis report), this
-subagent is skipped — proceed directly to Subagent 3.
+### What it does:
+1. Spawns S1 (Analysis) and waits for ANALYSIS REPORT
+2. Spawns S2 (Core Flow Infra) if flow type doesn't exist, waits for CORE FLOW REPORT
+3. Spawns S3 (Connector Integration), waits for CONNECTOR REPORT
+4. Spawns S4 (Testing), waits for TEST REPORT
+5. On FAIL → re-spawns S3 with error context, then S4 (retry loop)
+6. On CAPABILITY_MISMATCH → switches connector, re-spawns S3 then S4
+7. On PASS → spawns S5 (Push & PR), waits for PR REPORT
+8. Returns final result to Batch Orchestrator
 
-### Prompt Template
+### Retry logic (handled internally):
 
 ```
-You are creating flow type infrastructure in connector-service (Rust).
+connector = primary_connector
+connector_list = <from ANALYSIS REPORT>
+attempt = 1
 
-## Analysis Report
-{{PASTE FULL ANALYSIS REPORT FROM SUBAGENT 1}}
+while True:
+    s3_result = spawn S3(connector, retry_context if attempt > 1)
+    s4_result = spawn S4(connector)
+
+    if PASS → break, proceed to S5
+    elif CAPABILITY_MISMATCH → connector = next(connector_list), or ESCALATE
+    elif FAIL → attempt += 1, loop to S3 with error context
+```
+
+### Per-Flow Orchestrator Prompt Template
+
+**Copy, fill `{{PLACEHOLDERS}}`, pass as `prompt` to Task tool.**
+
+```
+You are a Per-Flow Orchestrator. Your job is to migrate ONE flow from
+euler-api-txns (Haskell) to connector-service (Rust) by managing a 5-stage
+pipeline. Each stage is a subagent you spawn via the Task tool.
+
+## Your Target
+
+- **Flow:** {{FLOW_NAME}}
+- **Primary Connector:** {{CONNECTOR_NAME}}
+- **Branch:** {{BRANCH_NAME}}
+- **Flow Number:** {{FLOW_NUMBER}} of {{TOTAL_FLOWS}} in this batch
 
 ## Repos
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
 - connector-service: /home/kanikachaudhary/Kanika/connector-service/
+- Credentials: /home/kanikachaudhary/Kanika/creds.json
+- Workflow docs: /home/kanikachaudhary/Kanika/flow-migration-workflow/
 
-## Workflow Docs (read these before writing code)
-- New flow type (7-layer guide): /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
-- Per-flow implementation: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
-- Type mapping reference: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.1_type_mapping.md
-- Code pattern translation: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
-- File references: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.3_file_references.md
+## CRITICAL: You are an orchestrator. You do NOT write code, run builds,
+edit files, or run tests yourself. You spawn subagents via Task tool for
+ALL work. You read their results, pass handoff data, and handle retry logic.
 
-## Tasks
+## Your Pipeline: S1 → S2 → S3 ↔ S4 → S5
 
-0. **Create a fresh branch from main:**
-   ```bash
-   git checkout main && git pull origin main
-   git checkout -b feat/<connector>-<flow-name>
-   ```
-   Every flow MUST get its own branch. Never reuse an existing feature branch.
-
-1. **Create the target flow type** (if it does NOT exist in connector-service):
-   Follow 4.5_new_flow_type.md to create all 7 layers:
-   - Layer 1: Flow marker struct + FlowName enum variant (connector_flow.rs)
-   - Layer 2: Request/response domain types (connector_types.rs)
-   - Layer 3: Sub-trait definition (interfaces/connector_types.rs)
-   - Layer 4: Proto messages + RPC (payment.proto + services.proto)
-   - Layer 5: Proto-to-domain conversions (types.rs)
-   - Layer 6: gRPC handler (payments.rs)
-   - Layer 7: Default implementations for ALL connectors
-
-2. **Create pre-call flow types** (if any dependencies in the analysis report
-   are missing their flow type in connector-service):
-   - For each pre-call flow that doesn't exist, create all 7 layers
-   - These go on the SAME branch as the target flow
-
-3. **Update flow marker mappings** in:
-   - crates/common/common_utils/src/events.rs (FlowName enum + as_str)
-   - crates/types-traits/ucs_interface_common/src/flow.rs (type_id mapping)
-
-4. **Run lint, format, and build:**
-   ```bash
-   cargo clippy --all-targets --all-features
-   cargo +nightly fmt --all
-   cargo build
-   ```
-   Fix any errors and repeat until all three pass cleanly.
-   Only pre-existing future-incompat warnings from upstream deps are acceptable.
-
-5. **Commit the core flow infrastructure changes:**
-   ```bash
-   git add -A
-   git commit -m "feat(<connector>): add <FlowName> flow type infrastructure"
-   ```
-   This commit contains ONLY the flow type infrastructure (marker, types, traits,
-   proto, handler, defaults). Connector-specific code goes in a separate commit
-   by Subagent 3. This separation makes the PR easier to review and allows
-   reverting connector code without touching the flow infrastructure.
-
-## Rules
-
-- Follow connector-service naming conventions, NOT euler-api-txns conventions.
-  Before introducing ANY new field or type name:
-  1. Grep existing .proto files in crates/types-traits/grpc-api-types/proto/
-  2. Grep existing Rust domain types in crates/types-traits/domain_types/src/
-  3. Use whatever name the codebase already uses for that concept
-  4. Only invent a new name if the concept is genuinely new to connector-service
-  Gateway-specific serde renames (matching the external API) are fine.
-
-- ResponseRouterData has exactly 2 type params: ResponseRouterData<Response, RouterData>
-  (defined at crates/integrations/connector-integration/src/types.rs). NOT 5.
-
-- Do NOT write connector-specific integration code in this subagent. Only create
-  the flow type infrastructure (traits, types, proto, handlers, defaults).
-
-- Use the field naming map from the analysis report for all proto/domain fields.
-
-- **Response/request data type reuse rule:**
-  Reuse `PaymentsResponseData` (add a variant if needed) when the flow is semantically
-  a payment transaction (auth, sync, capture, void, 3DS). Create a standalone struct
-  only when the flow is a fundamentally different operation (wallet balance, OTP, mandate
-  lifecycle, order creation) whose response fields have zero semantic overlap with payment
-  concepts. See `4.5_new_flow_type.md` Layer 2 for the full decision guide.
-
-## Return Format
-
-Return a core flow report with:
-
-### CORE FLOW REPORT
-
-**Flow:** <name>
-**Flow type created:** YES / NO (already existed)
-**Pre-call flow types created:** [list] or "None needed"
-**Commit SHA:** <sha>
-
-**Files modified/created:**
-| File | What was changed |
-|...|...|
-
-**Build status:** PASS/FAIL
-**Clippy status:** PASS/FAIL (zero warnings)
-**Fmt status:** PASS/FAIL (no changes)
-
-**Any issues or decisions that need human input:** [list or "None"]
-```
-
-### Handoff → Subagent 3
-
-Pass the core flow report (especially the flow types created and files modified)
-as context to Subagent 3.
+Execute these 5 stages in order. Each stage is a Task tool invocation.
+Pass the structured report from each stage into the next stage's prompt.
 
 ---
 
-## Subagent 3: Connector Integration
+### STAGE 1: ANALYSIS
 
-**Type:** `general`
+Spawn a `general` subagent. Its job is to analyze the flow across all 3 repos
+by spawning 3 PARALLEL `explore` sub-subagents, then merging results.
 
-**Purpose:** Implement connector-specific integration for the target flow AND all
-pre-call dependencies. This subagent writes the request/response transformers, URL
-construction, headers, auth, error handling — everything specific to how this
-connector talks to the payment gateway. Runs clippy + fmt + build.
+**Task for S1:**
 
-This subagent may be re-spawned by the orchestrator if:
-- Testing fails (with error details to fix)
-- A connector capability mismatch requires switching to a different connector
+Analyze the {{FLOW_NAME}} flow for migration to connector-service.
 
-### Prompt Template
+You must spawn 3 PARALLEL explore sub-subagents to search independently:
 
-```
-You are implementing connector-specific integration in connector-service (Rust).
+**S1.1 — Search euler-api-txns** (explore, PARALLEL):
+- Repo: /home/kanikachaudhary/Kanika/euler-api-txns/
+- Search euler-x/src-generated/Gateway/CommonGateway.hs for the dispatcher
+  that routes {{FLOW_NAME}} to per-gateway implementations
+- For each gateway found, read its Flow.hs and document:
+  function name, file:line, endpoint URL, auth method, request fields (name,
+  type, required/optional), response fields (success + failure shapes),
+  encoding, special handling
+- Also check Endpoints.hs / Env.hs for base URLs
 
-## Analysis Report
-{{PASTE FULL ANALYSIS REPORT FROM SUBAGENT 1}}
+**S1.2 — Search euler-api-gateway** (explore, PARALLEL):
+- Repo: /Users/kanika.c/code/workflow/euler-api-gateway/
+- Search gateway/src/Euler/API/Gateway/Gateway/ for implementations of
+  {{FLOW_NAME}} (some gateways like PINELABS_ONLINE, KOTAK_BIZ, CRED,
+  SODEXO, YES_BIZ exist here but NOT in euler-api-txns)
+- For each gateway found, document same details as S1.1
+- Check Routes.hs for endpoint URLs
 
-## Core Flow Report
-{{PASTE CORE FLOW REPORT FROM SUBAGENT 2}}
+**S1.3 — Search connector-service** (explore, PARALLEL):
+- Repo: /home/kanikachaudhary/Kanika/connector-service/
+- Check crates/types-traits/domain_types/src/connector_flow.rs for existing
+  flow marker struct matching {{FLOW_NAME}}
+- Check crates/types-traits/interfaces/src/connector_types.rs for sub-trait
+- Check crates/types-traits/grpc-api-types/proto/services.proto for RPC
+- For each Haskell field name found by S1.1/S1.2, grep existing .proto files
+  and Rust domain types to find connector-service's name for that concept
+- Check if {{CONNECTOR_NAME}} has any existing implementation (real or stub)
+  for this flow
 
-## If retrying after a test failure:
-{{PASTE ERROR DETAILS AND DIAGNOSIS FROM SUBAGENT 4 TEST REPORT}}
-(Delete this section if this is the first attempt)
+After all 3 sub-subagents return, MERGE their results into a single
+ANALYSIS REPORT with these exact sections:
 
-## If switching connector after capability mismatch:
-Previous connector: {{NAME}} — failed with: {{ERROR}}
-Now implementing: {{NEW CONNECTOR NAME}}
-(Delete this section if this is the first connector)
+- **Flow:** name
+- **Connectors that implement this flow:** [list from S1.1 + S1.2]
+- **Flow type exists in connector-service:** YES/NO (from S1.3)
+- **Per-Connector Analysis:** (from S1.1 + S1.2, for each connector)
+  - Haskell file, function, endpoint, auth, request/response fields, special handling
+- **Field Naming Map:** Haskell name → connector-service name (from S1.3)
+- **Flow Infrastructure Needed:** if flow type doesn't exist (from S1.3)
+  - Flow marker struct, sub-trait, proto RPC, request/response messages
+- **Pre-call Dependency Chain:** trace what inputs this flow needs (IDs,
+  tokens) and which prior flows produce them. For each dependency, state
+  whether it exists in connector-service (real/stub/missing). Build ordered
+  execution chain.
+- **Connector Capability for Testing:** can {{CONNECTOR_NAME}} test this
+  flow in sandbox? If not, identify fallback connector.
 
-## Repos
+---
+
+### STAGE 2: CORE FLOW INFRASTRUCTURE
+
+**Skip if Analysis Report says "Flow type exists: YES".** Set core_flow_report
+to "Skipped — flow type already exists" and proceed to S3.
+
+Otherwise, spawn a `general` subagent. Its job is to create the flow type
+infrastructure by first reading docs in parallel, then implementing.
+
+**Task for S2:**
+
+Create the flow type infrastructure for {{FLOW_NAME}} in connector-service.
+
+First, spawn PARALLEL `explore` sub-subagents to read reference material:
+
+**S2.1 — Read implementation guides** (explore, PARALLEL):
+- Read /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
+  (the 7-layer guide — this is the primary reference)
+- Read /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
+- Summarize the 7 layers and rules
+
+**S2.2 — Read reference material** (explore, PARALLEL):
+- Read /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.1_type_mapping.md
+- Read /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
+- Read /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.3_file_references.md
+- Summarize exact file paths for each layer and naming conventions
+
+After the reads complete, spawn a `general` sub-subagent to implement:
+
+**S2.3 — Implement core flow infrastructure** (general, SEQUENTIAL after S2.1 + S2.2):
+- Analysis Report: {{PASTE ANALYSIS REPORT}}
+- Guides summary: {{PASTE S2.1 RESULT}}
+- File references: {{PASTE S2.2 RESULT}}
+- Branch: {{BRANCH_NAME}}
+- Create fresh branch from main
+- Create all 7 layers (marker, domain types, sub-trait, proto, conversions,
+  gRPC handler, default impls) for the target flow AND any pre-call flow
+  types that are missing
+- Update FlowName enum in events.rs and type_id mapping in flow.rs
+- Run cargo clippy + fmt + build — fix until clean
+- Commit: "feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} flow type infrastructure"
+- Return CORE FLOW REPORT: branch, flow type created, pre-call types created,
+  commit SHA, files modified, build/clippy/fmt status
+
+RULES for S2.3:
+- connector-service naming conventions, NOT euler-api-txns
+- ResponseRouterData has exactly 2 type params
+- Reuse PaymentsResponseData for payment-semantic flows; standalone struct
+  for different domains (wallet, OTP, mandate lifecycle)
+- Do NOT write connector-specific code — only flow type infrastructure
+- BEFORE COMMIT: cargo clippy --all-targets --all-features && cargo +nightly fmt --all
+
+---
+
+### STAGE 3: CONNECTOR INTEGRATION
+
+Spawn a `general` subagent. Its job is to implement connector-specific code
+by first reading Haskell sources in parallel, then implementing.
+
+**Task for S3:**
+
+Implement {{CONNECTOR_NAME}} connector integration for {{FLOW_NAME}}.
+
+First, spawn PARALLEL `explore` sub-subagents to read source code:
+
+**S3.1 — Read Haskell sources for pre-call flows** (explore, PARALLEL):
+(Skip if no pre-call dependencies in the Analysis Report)
+- For each pre-call flow in the dependency chain, read the Haskell
+  implementation in euler-api-txns or euler-api-gateway for {{CONNECTOR_NAME}}
+- Document: endpoint URL, request construction, response parsing, auth,
+  headers, encoding
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
 
-## Workflow Docs (read these before writing code)
-- New flow type (7-layer guide): /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
-- Per-flow implementation: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
-- Create connector: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.1_create_connector.md
-- Type mapping reference: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.1_type_mapping.md
-- Code pattern translation: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
-- File references: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.3_file_references.md
+**S3.2 — Read Haskell sources for target flow** (explore, PARALLEL):
+- Read the {{CONNECTOR_NAME}} implementation of {{FLOW_NAME}} in
+  euler-api-txns or euler-api-gateway
+- Document: endpoint URL, request construction (every field, how it's built),
+  response parsing (every field, how status is determined), auth headers,
+  checksum/signature algorithm, encoding, error handling
 
-## Tasks
+**S3.3 — Read existing connector code in connector-service** (explore, PARALLEL):
+- Repo: /home/kanikachaudhary/Kanika/connector-service/
+- Read the {{CONNECTOR_NAME}} module under
+  crates/integrations/connector-integration/src/connectors/
+- Find how existing flows are implemented (get_url, get_headers,
+  get_request_body, handle_response_v2 patterns)
+- Check which pre-call flows already have REAL implementations vs empty stubs
+- Find create_all_prerequisites! and macro_connector_implementation! macros
 
-**MANDATORY PRE-CALL GATE (before ANY implementation):**
-Before writing a single line of connector code for the target flow, check the
-analysis report's pre-call dependency chain. For EVERY pre-call flow listed:
-- Does it have a REAL (non-empty, non-stub) connector implementation for this
-  connector in connector-service?
-- If NO — you MUST implement it first. An empty stub (`impl ... {}`) is NOT
-  a real implementation.
-- If the pre-call's flow type doesn't exist either, go back to the orchestrator
-  to have Subagent 2 create it.
-**Do NOT proceed to implementing the target flow until ALL pre-call connector
-integrations are real, buildable, and functional.** Skipping a pre-call and
-planning to "use a dummy value for testing" is a VIOLATION of this workflow.
-There are NO exceptions.
+After reads complete, spawn a `general` sub-subagent to implement:
 
-1. **Implement pre-call connector integrations first** (if any dependencies
-   identified in the analysis report):
-   - For each pre-call flow in the dependency chain, implement the connector's:
-     - Request transformer (Haskell request → Rust request)
-     - Response transformer (PG response → Rust domain response)
-     - URL construction (get_url)
-     - Headers (get_headers) including checksums/signatures
-     - Content type
-     - Error response handling
-   - Register each flow in create_all_prerequisites! and macro_connector_implementation!
-   - These must produce the outputs needed by the target flow (IDs, tokens, etc.)
-   - **Verify each pre-call is NOT an empty stub.** If the connector has
-     `impl ConnectorIntegrationV2<...> for Connector<T> {}` with no method
-     bodies, that is an empty stub — you must add the real get_url,
-     get_request_body, handle_response_v2 methods.
+**S3.4 — Implement connector integration** (general, SEQUENTIAL):
+- Analysis Report: {{PASTE ANALYSIS REPORT}}
+- Core Flow Report: {{PASTE CORE FLOW REPORT}}
+- Haskell pre-call sources: {{PASTE S3.1 RESULT}}
+- Haskell target sources: {{PASTE S3.2 RESULT}}
+- Existing connector patterns: {{PASTE S3.3 RESULT}}
+- If retrying: {{PASTE ERROR DETAILS FROM S4 TEST REPORT}}
+- If switching connector: previous={{OLD}}, now={{NEW}}, reason={{ERROR}}
 
-2. **Implement the target flow's connector integration:**
-   - Request transformer (Haskell request → Rust request)
-   - Response transformer (gateway response → Rust domain response)
-   - URL construction (get_url)
-   - Headers (get_headers) — including any checksums/signatures
-   - Content type
-   - Error response handling
+MANDATORY PRE-CALL GATE: Before writing ANY code for the target flow,
+verify ALL pre-call dependencies have REAL connector implementations.
+Empty stubs (impl ... {} with no methods) are NOT real. Implement all
+missing pre-calls FIRST. NEVER plan to "use dummy values for testing".
+
+Implementation tasks:
+1. Implement pre-call connector integrations (if any missing/stub)
+2. Implement target flow connector integration:
+   - Request transformer, response transformer, get_url, get_headers,
+     content type, error handling
    - Register in create_all_prerequisites! and macro_connector_implementation!
+3. Update config TOMLs if new config fields needed (all 3: development,
+   sandbox, production)
+4. Update field-probe auth if ConnectorSpecificConfig changed
+5. cargo clippy + fmt + build — fix until clean
+6. Commit: "feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} connector integration"
+   (or "fix(...): ..." if retry)
 
-3. **Update config files** if the connector needs new config fields
-   (e.g., secondary_base_url). Update all 3 TOML files:
-   - config/development.toml
-   - config/sandbox.toml
-   - config/production.toml
+RULES:
+- connector-service naming conventions
+- ResponseRouterData has exactly 2 type params
+- Do NOT modify existing working connector code
+- Full authority to modify any layer needed
+- ZERO TOLERANCE for dummy values
 
-4. **Update field-probe auth** if you added new fields to ConnectorSpecificConfig.
-   File: crates/internal/field-probe/src/auth.rs
-
-5. **Run lint, format, and build:**
-   ```bash
-   cargo clippy --all-targets --all-features
-   cargo +nightly fmt --all
-   cargo build
-   ```
-   Fix any errors and repeat until all three pass cleanly.
-
-6. **Commit the connector integration changes:**
-   ```bash
-   git add -A
-   git commit -m "feat(<connector>): add <FlowName> connector integration for <Connector>"
-   ```
-   This commit contains ONLY connector-specific code (transformers, URL, headers,
-   auth, error handling, config changes). The core flow infrastructure was already
-   committed by Subagent 2 in a separate commit.
-
-   If this is a retry (fixing a test failure), commit the fix:
-   ```bash
-   git add -A
-   git commit -m "fix(<connector>): fix <brief description of what was wrong>"
-   ```
-
-## If this is a retry after test failure:
-- Read the error details from the test report
-- Diagnose: wrong URL? bad auth? missing field? parse error? wrong status mapping?
-- Fix the specific issue in the connector code
-- Rebuild and verify
-- Do NOT rewrite unrelated code — focus on the specific failure
-
-## Rules
-
-- Follow connector-service naming conventions, NOT euler-api-txns conventions.
-  Before introducing ANY new field or type name:
-  1. Grep existing .proto files in crates/types-traits/grpc-api-types/proto/
-  2. Grep existing Rust domain types in crates/types-traits/domain_types/src/
-  3. Use whatever name the codebase already uses for that concept
-  4. Only invent a new name if the concept is genuinely new to connector-service
-  Gateway-specific serde renames (matching the external API) are fine.
-
-- ResponseRouterData has exactly 2 type params: ResponseRouterData<Response, RouterData>
-  (defined at crates/integrations/connector-integration/src/types.rs). NOT 5.
-
-- Do NOT modify any existing connector's working code — only add new code for the
-  new flow.
-
-- Use the field naming map from the analysis report for all proto/domain fields.
-
-- You have full authority to modify any layer of code needed: core flow logic,
-  connector integrations, pre-call implementations, proto definitions, config.
-  Do not stop at partial implementation. Do not rely on manual intervention.
-  Automatically implement all missing dependencies.
-
-## Return Format
-
-Return a connector report with:
-
-### CONNECTOR REPORT
-
-**Connector:** <name>
-**Target flow implemented:** YES
-**Pre-call flows implemented:** [list] or "None needed"
-**Commit SHA:** <sha>
-
-**Files modified/created:**
-| File | What was changed |
-|...|...|
-
-**Build status:** PASS/FAIL
-**Clippy status:** PASS/FAIL (zero warnings)
-**Fmt status:** PASS/FAIL (no changes)
-
-**Is this a retry?** YES (attempt #N, fixing: <issue>) / NO (first attempt)
-**Is this a connector switch?** YES (from <old> to <new>, reason: <mismatch>) / NO
-
-**Any issues or decisions that need human input:** [list or "None"]
-```
-
-### Handoff → Subagent 4
-
-Pass the connector report (especially the files modified list, connector name,
-and pre-call flows implemented) as context to Subagent 4.
+Return CONNECTOR REPORT: connector, target implemented, pre-calls implemented,
+commit SHA, files modified, build/clippy/fmt status, retry info
 
 ---
 
-## Subagent 4: Testing
+### STAGE 4: TESTING
 
-**Type:** `general`
+Spawn a `general` subagent. This is inherently sequential — no sub-subagents.
 
-**Purpose:** Execute the full pre-call chain via grpcurl, then test the target flow.
-MUST achieve HTTP 200 with valid business data. Returns PASS, FAIL, or
-CAPABILITY_MISMATCH to the orchestrator.
+**Task for S4:**
 
-The task is NOT complete until the connector returns HTTP 200. On failure, the
-orchestrator will re-run Subagent 3 → Subagent 4 in a loop until success.
+Test the {{FLOW_NAME}} flow for {{CONNECTOR_NAME}} in connector-service.
 
-### Prompt Template
-
-```
-You are testing a newly implemented flow in connector-service via gRPC.
-
-## Analysis Report
-{{PASTE FULL ANALYSIS REPORT FROM SUBAGENT 1 — especially the dependency chain}}
-
-## Connector Report
-{{PASTE CONNECTOR REPORT FROM SUBAGENT 3}}
-
-## Repos
+- Analysis Report: {{PASTE ANALYSIS REPORT}}
+- Connector Report: {{PASTE CONNECTOR REPORT}}
 - connector-service: /home/kanikachaudhary/Kanika/connector-service/
-- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-
-## Workflow Docs
-- Testing strategy (§8.1.5 Smoke Test): /home/kanikachaudhary/Kanika/flow-migration-workflow/8_testing_and_operations/8.1_testing_strategy.md
-
-## Tasks
-
-**MANDATORY PRE-TEST VALIDATION (before building the server):**
-Before running ANY test, verify that the Connector Report from Subagent 3
-confirms ALL pre-call dependencies have been implemented with REAL connector
-integrations (not empty stubs). Check:
-- Does the connector report list "Pre-call flows implemented: [list]"?
-- Does the list match the analysis report's dependency chain?
-- If ANY pre-call is missing or was listed as "None needed" when the analysis
-  report says otherwise, STOP. Return FAIL to the orchestrator immediately
-  with: "Pre-call dependency <flow> was not implemented by Subagent 3.
-  Cannot test with dummy values. Re-run Subagent 3 to implement <flow> first."
-**NEVER substitute a dummy/hardcoded/placeholder value for an ID, token, or
-reference that should come from a pre-call flow. This is the #1 cause of
-false test results and is an absolute violation of this workflow.**
-
-Follow section 8.1.5 of the testing strategy doc precisely:
-
-1. **Build and start the gRPC server:**
-   ```bash
-   export PATH="$HOME/.cargo/bin:$PATH"
-   cargo build -p grpc-server
-   RUN_ENV=development nohup ./target/debug/grpc-server > /tmp/grpc-server.log 2>&1 &
-   sleep 5
-   ```
-
-2. **Get connector credentials from creds.json.**
-   Credentials for all supported connectors are stored at:
-   `/home/kanikachaudhary/Kanika/creds.json`
-   - Read this file and find the credentials for <CONNECTOR_NAME>
-   - Extract the fields needed for the `x-connector-config` header (e.g.,
-     api_key, api_secret, merchant_id, salt_key, salt_index — varies by connector)
-   - Build the `x-connector-config` header in serde JSON format:
-     `{"config":{"<ConnectorVariant>":{...fields...}}}`
-   - If the connector is NOT found in creds.json, THEN ask the user for credentials.
-   Do NOT proceed without real credentials. Do NOT use placeholder values.
-
-3. **Verify the correct endpoint URLs BEFORE testing.**
-   Before sending any request, cross-reference the URL your implementation uses
-   against the Haskell source in euler-api-txns:
-   - Read the gateway's Endpoints.hs file (e.g., Gateway/PhonePe/Endpoints.hs)
-   - Read the gateway's Flow.hs file for the actual URL used by this specific flow
-   - Verify the base URL domain is correct (e.g., PhonePe wallet flows use Mercury/
-     pg-sandbox, NOT Hermes/PG)
-   - Verify the path is correct (e.g., /v3/merchant/otp/send, /v3/wallet/balance)
-   - If the URL in config/development.toml needs to be changed for testing, note
-     what you changed — you will need to revert it before pushing.
-   - Do this for EVERY flow in the pre-call chain AND the target flow.
-
-4. **Execute the pre-call dependency chain via grpcurl.**
-   If the analysis report lists pre-call dependencies:
-   - Execute each pre-call flow via grpcurl in dependency order
-   - Capture output IDs/tokens from each response (e.g., customer_id from
-     CreateCustomer, token_id from SetupMandate)
-   - Feed those outputs as inputs to the next call in the chain
-   - If a pre-call fails: this is a FAIL — report back to orchestrator with
-     the specific error so Subagent 3 can fix the pre-call implementation
-   - Do NOT skip pre-calls. Do NOT use dummy/placeholder values.
-   - Do NOT use hardcoded test IDs unless they are known-valid connector sandbox
-     test fixtures documented in the connector's API docs.
-
-5. **Test the target flow** using real outputs from the pre-call chain.
-
-6. **Evaluate the response — STRICT:**
-
-   **PASS:** HTTP 200 with correct business data. This is the ONLY acceptable
-   outcome. The task succeeds.
-
-   **CAPABILITY_MISMATCH:**
-   The connector returns "feature not enabled", "recurring not supported",
-   "not available in test mode", or similar errors indicating the connector's
-   test environment CANNOT support this flow. This is NOT a code bug — it is
-   an environment limitation.
-   → Return CAPABILITY_MISMATCH to orchestrator with the specific error.
-   The orchestrator will pick the next connector and re-run Subagents 3→4.
-
-   **FAIL:**
-   Any other non-200: wrong URL, bad auth, parse error, missing field, wrong
-   status mapping, gRPC error, "Api Mapping Not Found", request body mismatch,
-   credential errors, etc.
-   → Return FAIL to orchestrator with:
-     - The exact error message
-     - The full grpcurl command and response
-     - Your diagnosis of the root cause
-     - Suggested fix (which file, which function, what to change)
-   The orchestrator will re-spawn Subagent 3 to fix, then re-run Subagent 4.
-
-   **A non-200 where pre-calls were skipped or dummy values were used is
-   ALWAYS a FAIL. "I used a dummy token" is never a valid result.**
-
-7. **Track any test-only config changes.**
-   If you modified config/development.toml (e.g., changed a base_url or
-   secondary_base_url to point to a different environment for testing), record:
-   - Which file was changed
-   - What the original value was
-   - What you changed it to
-   - WHY it needed to be changed for testing
-   These changes MUST be reverted before pushing (handled by Subagent 5).
-
-8. **Stop the server** after testing:
-   ```bash
-   kill $(pgrep -f grpc-server) 2>/dev/null
-   ```
-
-## Return Format
-
-Return a test report with:
-
-### TEST REPORT
-
-**Flow:** <name>
-**Connector:** <name>
-**Result:** PASS / FAIL / CAPABILITY_MISMATCH
-**Attempt:** #N
-
-**Pre-call chain executed:**
-| Step | Flow | grpcurl command | Response status | Output captured |
-|------|------|-----------------|-----------------|-----------------|
-| 1 | <flow> | <cmd> | 200 | customer_id=xxx |
-| 2 | <target> | <cmd> | 200 | — |
-(or "No pre-calls needed")
-
-**Target flow grpcurl command (with credentials):**
-```bash
-<full command as executed>
-```
-
-**Target flow response:**
-```json
-<full response JSON>
-```
-
-**HTTP status code from connector:** <code>
-**Verification notes:** <what was checked>
-
-**If FAIL — root cause diagnosis:**
-- Root cause: <what went wrong>
-- Suggested fix: <what to change, in which file>
-- Files likely affected: <list>
-
-**If CAPABILITY_MISMATCH:**
-- Connector: <name>
-- Error: <exact error message from connector>
-- Reason: <why this connector can't test this flow in its test environment>
-- Next connector to try: <from analysis report, or "none remaining">
-
-**Test-only config changes made (to be reverted before push):**
-| File | Original value | Test value | Reason |
-|---|---|---|---|
-| <file> | <original> | <test value> | <reason> |
-(or "None" if no config changes were needed)
-
-**Issues:** [list or "None"]
-```
-
-### Handoff → Subagent 5 (only on PASS)
-
-Pass the test report as context to Subagent 5. Do NOT hand off on FAIL or
-CAPABILITY_MISMATCH — those go back to the orchestrator for retry.
-
----
-
-## Subagent 5: Push & PR
-
-**Type:** `general`
-
-**Purpose:** Revert any test-only config changes, push the branch, and raise a PR
-with a proper title, description, and test evidence. The code is already committed
-in separate commits by Subagent 2 (core flow infra) and Subagent 3 (connector
-integration).
-
-### Prompt Template
-
-```
-You are finalizing and raising a PR for a newly implemented flow in connector-service.
-
-## Connector Report
-{{PASTE CONNECTOR REPORT FROM SUBAGENT 3}}
-
-## Test Report
-{{PASTE TEST REPORT FROM SUBAGENT 4}}
-
-## Repos
-- connector-service: /home/kanikachaudhary/Kanika/connector-service/
-
-## Workflow Docs
+- Credentials: /home/kanikachaudhary/Kanika/creds.json
 - Testing strategy: /home/kanikachaudhary/Kanika/flow-migration-workflow/8_testing_and_operations/8.1_testing_strategy.md
 
-## Tasks
+MANDATORY PRE-TEST VALIDATION: Verify Connector Report confirms ALL pre-call
+dependencies were implemented with REAL integrations. If any missing, return
+FAIL immediately — never use dummy/placeholder values.
 
-1. **Revert any test-only config changes.**
-   Check the test report for "Test-only config changes made". If any config files
-   (development.toml, sandbox.toml, production.toml) were modified solely for
-   testing (e.g., a base_url was pointed to a different environment), revert those
-   changes now.
-   ```bash
-   git diff config/  # verify what changed
-   # If any changes are test-only, revert and commit:
-   git checkout config/development.toml
-   git add -A
-   git commit -m "chore: revert test-only config changes"
-   ```
+Steps (all sequential):
+1. Build: cargo build -p grpc-server
+2. Start: RUN_ENV=development nohup ./target/debug/grpc-server > /tmp/grpc-server.log 2>&1 &
+3. Read creds.json, find {{CONNECTOR_NAME}} credentials, build x-connector-config header
+4. Verify endpoint URLs against Haskell source (cross-reference Endpoints.hs/Env.hs)
+   — if config/development.toml needs temp changes, record them
+5. Execute pre-call dependency chain via grpcurl in order, capture output IDs/tokens
+6. Test target flow using real pre-call outputs
+7. Evaluate response:
+   - PASS: HTTP 200 with correct business data
+   - CAPABILITY_MISMATCH: connector says "not supported/enabled in test" (env limitation)
+   - FAIL: any other non-200 (code bug — diagnose root cause, suggest fix)
+8. Record test-only config changes (to be reverted by S5)
+9. Stop server: kill $(pgrep -f grpc-server)
 
-2. **Run pre-commit checks:**
-   ```bash
-   cargo clippy --all-targets --all-features
-   cargo +nightly fmt --all
-   ```
-   If either produces changes, commit them:
-   ```bash
-   git add -A
-   git commit -m "chore: apply fmt/clippy fixes"
-   ```
+Return TEST REPORT: flow, connector, result (PASS/FAIL/CAPABILITY_MISMATCH),
+attempt number, pre-call chain (commands + responses), target flow command,
+target flow full response JSON, HTTP status, root cause diagnosis (if FAIL),
+capability error (if MISMATCH), test-only config changes
 
-3. **Verify the commit history** on this branch is clean:
-   ```bash
-   git log --oneline main..HEAD
-   ```
-   You should see separate commits for:
-   - Core flow infrastructure (from Subagent 2)
-   - Connector integration (from Subagent 3)
-   - Any retry fixes (from Subagent 3 retries, if applicable)
-   - Config revert / fmt fixes (from this subagent, if applicable)
+---
 
-4. **Push the branch:**
-   ```bash
-   git push -u origin <branch-name>
-   ```
+### STAGE 5: PUSH & PR
 
-5. **Create the PR** using `gh pr create` with the following structure:
+Only spawn on PASS from S4.
 
-   **Title:** `feat(<connector>): add <FlowName> flow for <Connector>`
+Spawn a `general` subagent. This is inherently sequential.
 
-   **Body must include these sections:**
+**Task for S5:**
 
-   ### Summary
-   - Brief bullet points from the connector report: what was added, which
-     layers were touched, any config changes, any pre-call flows implemented.
+Finalize and raise PR for {{FLOW_NAME}} / {{CONNECTOR_NAME}}.
 
-   ### Test Results
+- Connector Report: {{PASTE CONNECTOR REPORT}}
+- Test Report: {{PASTE TEST REPORT}}
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+- Branch: {{BRANCH_NAME}}
 
-   ```markdown
-   ## How did you test this?
+Steps:
+1. Revert test-only config changes (from Test Report)
+2. Run cargo clippy + fmt — commit if changes produced
+3. Verify commit history: git log --oneline main..HEAD
+   (should show: S2 infra commit, S3 connector commit, any fix/chore commits)
+4. Push: git push -u origin {{BRANCH_NAME}}
+5. Create PR via gh pr create:
+   - Title: feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} flow for {{CONNECTOR_NAME}}
+   - Body: Summary bullets + test results section
+   - Test section: grpcurl command (x-connector-config REDACTED, secrets in
+     request body replaced with placeholders), FULL unredacted response JSON
+   - Note any test-only config that was reverted
 
-   ### gRPC smoke test against <Connector> preprod — PASS
+SECURITY: Redact x-connector-config header value entirely. Replace secrets
+in request body with <PLACEHOLDER>. NEVER redact any part of response body.
 
-   **Pre-call chain:**
-   <list each pre-call step, or "No pre-calls needed">
+Return PR REPORT: PR URL, branch, commits table, title, test status,
+config reverted, pre-call flows included, files changed, lines +/-
 
-   **Request:**
-   ```bash
-   grpcurl -plaintext \
-     -H 'x-connector-config: <REDACTED>' \
-     -H 'x-merchant-id: <merchant_id>' \
-     -H 'x-tenant-id: default' \
-     -H 'x-request-id: test_001' \
-     -H 'x-connector-request-reference-id: test_ref_001' \
-     -d '<request body — replace only secrets (API keys, salt keys) with placeholders>' \
-     localhost:8000 types.PaymentService/<FlowRpcName>
-   ```
+---
 
-   **Response (HTTP 200 — SUCCESS):**
-   ```json
-   <FULL response JSON exactly as returned — do NOT redact any part of the response>
-   ```
-   ```
+### RETRY LOGIC (you handle this between S3 and S4):
 
-   ### Test-Only Config (if applicable)
-   If any config was temporarily changed for testing but reverted before commit,
-   mention it in the PR so reviewers know:
-   ```markdown
-   **Note:** During testing, `config/development.toml` had
-   `phonepe.secondary_base_url` set to `https://mercury-t2.phonepe.com/` (Mercury
-   preprod) to test the wallet endpoint. This has been reverted to the standard
-   value. To reproduce the test locally, set this URL in your development config.
-   ```
+```
+connector = "{{CONNECTOR_NAME}}"
+connector_list = <from ANALYSIS REPORT>
+attempt = 1
 
-## SECURITY RULES (MANDATORY)
+while True:
+    s3 = spawn S3(connector, retry_context if attempt > 1)
+    s4 = spawn S4(connector)
 
-- The `x-connector-config` header contains API keys, salt keys, merchant secrets.
-  ALWAYS replace the entire value with `<REDACTED>` in the PR request sample.
-- In the request body (`-d` argument), replace only secrets (API keys, salt keys,
-  auth tokens) with `<PLACEHOLDER>` descriptors (e.g., `<SALT_KEY>`, `<AUTH_TOKEN>`).
-  Non-secret identifiers like merchant_id and phone numbers can stay as-is.
-- **Leave the FULL response JSON exactly as returned.** Do NOT redact or placeholder
-  any part of the response body — reviewers need the complete raw output
-  (rawConnectorRequest, rawConnectorResponse, checksums, base64 payloads, field
-  values, headers, everything) to verify correctness.
-- Do NOT include any credentials in the commit message.
+    if PASS → break, proceed to S5
+    elif CAPABILITY_MISMATCH →
+        connector = next(connector_list)
+        if none left → return ESCALATION to Batch Orchestrator
+    elif FAIL →
+        attempt += 1
+        retry_context = s4.error_details
+        → loop to S3
+```
 
-## Return Format
+### What you return to the Batch Orchestrator:
 
-Return:
+### PER-FLOW RESULT
 
-### PR REPORT
-
-**PR URL:** <url>
-**Branch:** <branch>
-**Commits on branch:**
-| SHA | Message | Subagent |
-|-----|---------|----------|
-| <sha> | feat(...): add flow type infrastructure | S2 (Core Flow) |
-| <sha> | feat(...): add connector integration | S3 (Connector) |
-| <sha> | fix/chore (if any) | S3 retry / S5 |
-**PR Title:** <title>
-**Test status:** PASS
-**Test-only config reverted:** YES (list what) / NO (nothing to revert)
-**Pre-call flows included:** [list] or "None"
-**Files changed:** <count>
-**Lines added/removed:** +<added>/-<removed>
+**Flow:** {{FLOW_NAME}}
+**Status:** SUCCESS / ESCALATION
+**Connector:** <final connector used>
+**PR URL:** <url> (if SUCCESS)
+**Branch:** {{BRANCH_NAME}}
+**Escalation reason:** <reason> (if ESCALATION)
+**Attempts:** <count>
+**Connectors tried:** [list]
 ```
 
 ---
 
 ## Rules (Shared Across All Subagents)
 
-These rules apply to every subagent. Include them in the prompt context when
-spawning subagents that write code (Subagents 2, 3, and 5).
+These rules apply at every level. Any subagent that writes code must follow them.
 
-- **ONE BRANCH PER FLOW (with dependency exception).** Every flow gets its own
-  fresh branch from `main`. Independent flows always get separate branches.
-  Exception: pre-call dependency flows required for testing the target flow go
-  on the SAME branch — they are prerequisites, not independent features.
-  ```bash
-  git checkout main && git pull origin main
-  git checkout -b feat/<connector>-<flow-name>
-  ```
-- Do NOT modify any existing connector's working code — only add new code.
-- Do NOT remove or modify existing euler_txn gateway adapters.
-- If a type mapping is ambiguous, flag it and ask the user — do not guess.
-- If the gateway requires encryption (AES, JWE, RSA, etc.), flag it and ask
-  for guidance before implementing.
-- **Follow connector-service naming conventions, NOT euler-api-txns conventions.**
-  Before introducing ANY new field or type name:
-  1. Grep existing `.proto` files in `crates/types-traits/grpc-api-types/proto/`
-  2. Grep existing Rust domain types in `crates/types-traits/domain_types/src/`
-  3. Use whatever name the codebase already uses for that concept
-  4. Only invent a new name if the concept is genuinely new to connector-service
-  Gateway-specific serde renames (matching the external API) are fine.
-- **BEFORE EVERY COMMIT:**
-  ```bash
-  cargo clippy --all-targets --all-features   # zero errors/warnings
-  cargo +nightly fmt --all                     # zero formatting changes
-  ```
-- Do NOT amend commits or force push unless the user explicitly asks.
-- **Separate commits for core flow and connector code.** On the same branch,
-  use distinct commits for different layers of work:
-  - Subagent 2 commits: core flow infrastructure (flow marker, domain types,
-    sub-trait, proto, conversions, gRPC handler, default impls)
-  - Subagent 3 commits: connector-specific integration (transformers, URL,
-    headers, auth, error handling, config)
-  - Retry fix commits: targeted fixes from test failures
-  This separation makes PRs easier to review and allows reverting connector
-  code without touching flow infrastructure. Never squash these into one commit.
-- **Response/request data type reuse:** Do NOT blindly create a new response/request
-  data type for every flow. Reuse `PaymentsResponseData` (add a variant) when the flow
-  is semantically a payment transaction. Create a standalone struct only when the flow's
-  response fields have zero semantic overlap with payment transaction concepts (e.g.,
-  wallet balance, OTP tokens, mandate lifecycle). The deciding factor is **semantic
-  domain**, not field count. See `4.5_new_flow_type.md` Layer 2 for the full guide.
-- **Revert test-only config before commit.** If you changed `config/development.toml`
-  (or other config files) to point to a different URL for testing, revert those changes
-  before committing. Mention in the PR what was used for testing so reviewers can
-  reproduce.
-- **Pre-call dependencies go on the same branch.** If the target flow requires
-  pre-call flows (e.g., CreateCustomer before MandateStatusCheck), implement
-  those dependencies on the same branch. They are prerequisites, not independent
-  features.
-- **Full implementation authority.** You have full permission to modify any layer
-  of code required: core flow logic, connector integrations, pre-call
-  implementations, proto definitions, config. Do not stop at partial
-  implementation. Do not rely on manual intervention. Automatically implement
-  all missing dependencies.
-- **No false positives — ZERO TOLERANCE for dummy values.** A "bad request" or
-  4xx error must NOT be accepted if the required pre-calls (token creation, entity
-  setup, auth steps) were skipped or stubbed. This is the single most important
-  rule in this workflow. Violations include:
-  - Using a hardcoded/dummy/placeholder ID, token, or reference instead of
-    implementing the pre-call that produces it
-  - Seeing an empty stub (`impl ... {}`) for a pre-call flow and proceeding
-    to test with dummy data instead of implementing the real integration
-  - Accepting a 4xx response as "the pre-call isn't available" when the real
-    problem is that YOU didn't implement it
-  - Declaring a test "passed" or "acceptable" when pre-call outputs were faked
-  If you catch yourself about to type a dummy value for a field that should
-  come from a pre-call: STOP. Go back and implement the pre-call. There are
-  NO shortcuts and NO exceptions. Every ID, token, and reference used in
-  testing must come from a real grpcurl call to a real implemented flow.
-- **Connector fallback on capability mismatch.** If the chosen connector returns
-  "feature not enabled" or similar capability errors in its test environment,
-  do not stop. The orchestrator will auto-switch to another connector that
-  implements this flow (per the analysis report). The Connector Integration
-  subagent will implement the new connector, Testing will re-run the full
-  pre-call chain, and this cycle continues until a working connector is found
-  or all options are exhausted.
-- **Iterate until HTTP 200 — no partial results accepted.** The task is NOT
-  complete until the connector returns a successful business response (HTTP 200
-  with correct data). On any failure:
-  1. Diagnose the root cause (wrong URL, bad auth, missing field, parse error)
-  2. Fix the code (via Connector Integration subagent)
-  3. Rebuild (clippy + fmt + build)
-  4. Retest (via Testing subagent)
-  5. Repeat steps 1-4 until 200
-  If the connector returns a capability error, switch to the next connector
-  and repeat the full cycle. Do NOT stop, do NOT accept partial results, do NOT
-  declare the task complete with a non-200 response. The only exit conditions are:
-  (a) HTTP 200 received — proceed to Push & PR
-  (b) ALL connectors from the analysis report have been tried and ALL returned
-      environment-level capability limitations (not code bugs) — escalate to
-      user with exhaustive evidence from every connector attempted
+### Branching & Commits
+- **ONE BRANCH PER FLOW.** Fresh from `main`. Pre-call dependencies go on
+  the SAME branch (they're prerequisites, not independent features).
+- **Separate commits:** S2 commits core flow infra, S3 commits connector code.
+  Never squash into one commit.
+- **BEFORE EVERY COMMIT:** `cargo clippy --all-targets --all-features` +
+  `cargo +nightly fmt --all` — zero errors, zero warnings, zero formatting changes.
+- Do NOT amend commits or force push unless user explicitly asks.
+
+### Naming & Types
+- **connector-service naming conventions**, NOT euler-api-txns. Before adding any
+  new field/type name: grep existing .proto files and Rust domain types. Use
+  whatever name already exists for that concept.
+- **ResponseRouterData** has exactly 2 type params (not 5).
+- **Response type reuse:** `PaymentsResponseData` for payment-semantic flows.
+  Standalone struct only for fundamentally different domains (wallet, OTP, mandate).
+
+### Implementation Authority
+- Subagents have full authority to modify any layer: core flow, connector
+  integration, proto, config. Do not stop at partial implementation.
+- Do NOT modify existing working connector code — only add new code.
+- If type mapping is ambiguous or gateway needs encryption, flag and ask user.
+
+### Testing Integrity — ZERO TOLERANCE for Dummy Values
+- Every ID, token, and reference in testing MUST come from a real grpcurl call
+  to a real implemented flow. Violations:
+  - Hardcoded/placeholder IDs instead of implementing pre-calls
+  - Empty stubs treated as "good enough"
+  - 4xx accepted when the real problem is missing pre-call implementation
+  - Test declared "passed" with faked pre-call outputs
+- **Iterate until HTTP 200.** The only exit conditions:
+  (a) HTTP 200 with valid business data → Push & PR
+  (b) ALL connectors exhausted with environment limitations → escalate to user
+- **Connector fallback** on CAPABILITY_MISMATCH: auto-switch to next connector
+  from the analysis report.
+
+### Config & Security
+- Revert test-only config changes before committing.
+- In PRs: REDACT entire x-connector-config header, PLACEHOLDER secrets in
+  request body, NEVER redact response body.
 
 ---
 
 ## Variants
 
+### Single Flow
+
+```
+User: "Migrate the VerifyVpa flow"
+Batch Orchestrator → Task(Per-Flow Orchestrator: VerifyVpa) → report
+```
+
 ### Dry Run (Analysis Only)
 
-Only run Subagent 1. Skip Subagents 2-5. Return the analysis report to the user.
+Run only S1. Skip S2-S5.
 
 ```
-Analyze the <FlowName> flow for migration. Do NOT write any code.
-
-Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
-euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-connector-service: /home/kanikachaudhary/Kanika/connector-service/
+User: "Analyze CheckBalanceForWallet. Do NOT write code."
+Batch Orchestrator → Task(S1 Analysis only) → report to user
 ```
 
-### Gateway-Centric (Migrate Multiple Flows for One Gateway)
-
-When the user specifies a gateway and a list of flows:
+### Batch Migration (primary use case)
 
 ```
-Migrate flows Authorize, PSync, Capture for Razorpay to connector-service.
-
-Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
-euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-connector-service: /home/kanikachaudhary/Kanika/connector-service/
+User: "Migrate these 12 flows: [table]"
+Batch Orchestrator:
+  → Task(Flow 1/12: VerifyVpa / Razorpay) → report
+  → Task(Flow 2/12: ResendOtp / Razorpay) → report
+  → ... (all 12 sequentially)
+  → Batch summary
 ```
-
-The orchestrator runs Subagent 1 once (analyzing all flows for that gateway),
-then runs the **full Subagent 2→3→4→5 pipeline once per flow**, each on its own
-fresh branch from `main`. Each flow gets its own branch and PR.
-
-### Batch Planning (Multiple Gateways)
-
-```
-Plan migrations for HDFC, Paytm, Billdesk. Analysis only, no code.
-
-Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
-euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-connector-service: /home/kanikachaudhary/Kanika/connector-service/
-```
-
-Runs Subagent 1 for each gateway. Returns a prioritized migration plan.
 
 ---
 
 ## Quick Start Examples
 
-**Migrate one flow (most common):**
+**Migrate one flow:**
 ```
 Migrate the VerifyOtpForWallet flow to connector-service.
 
@@ -1072,20 +630,1306 @@ euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
 connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
 
-**Analyze first, then decide:**
+**Batch migrate 12 flows:**
 ```
-Analyze the CheckBalanceForWallet flow for migration. Do NOT write any code.
+Migrate these flows to connector-service:
+
+| # | Flow | Connector | Branch |
+|---|------|-----------|--------|
+| 1 | VerifyVpa | Razorpay | feat/razorpay-verify-vpa |
+| 2 | ResendOtpForWallet | Razorpay | feat/razorpay-resend-otp-for-wallet |
+| 3 | VerifyOtpForWallet | PhonePe | feat/phonepe-verify-otp-for-wallet |
+| 4 | DelinkWallet | PhonePe | feat/phonepe-delink-wallet |
+| 5 | InitiateTopup | PhonePe | feat/phonepe-initiate-topup |
+| 6 | VerifyTopupWebhook | Paytm | feat/paytm-verify-topup-webhook |
+| 7 | CreditToWallet | Razorpay | feat/razorpay-credit-to-wallet |
+| 8 | CreateSubscription | PhonePe | feat/phonepe-create-subscription |
+| 9 | MandateRevoke | Razorpay | feat/razorpay-mandate-revoke |
+| 10 | CancelRecurring | Cashfree | feat/cashfree-cancel-recurring |
+| 11 | UpdateMandateToken | Payu | feat/payu-update-mandate-token |
+| 12 | SplitSettlement | Razorpay | feat/razorpay-split-settlement |
 
 Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
 euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
 connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
 
-**Multiple flows for one gateway:**
-```
-Migrate flows VerifyOtpForWallet, CheckBalanceForWallet, DebitWallet for PhonePe to connector-service.
+---
 
-Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
-euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
-connector-service: /home/kanikachaudhary/Kanika/connector-service/
+## Implementation Notes for Batch Orchestrator
+
+### Filling the Per-Flow Orchestrator Prompt
+
+Replace these placeholders:
+
+| Placeholder | Source |
+|---|---|
+| `{{FLOW_NAME}}` | Migration plan |
+| `{{CONNECTOR_NAME}}` | Migration plan |
+| `{{BRANCH_NAME}}` | Migration plan |
+| `{{FLOW_NUMBER}}` | Sequential index |
+| `{{TOTAL_FLOWS}}` | Total count |
+
+All `{{PASTE ...}}` placeholders inside S1-S5 tasks are filled by the Per-Flow
+Orchestrator as it extracts handoff data between stages.
+
+### Error Handling at Batch Level
+
+- **ESCALATION** from a Per-Flow Orchestrator: report to user, ask whether to
+  continue or stop.
+- **Crash/hang**: report last known state, ask user.
+- Track successes and failures for final summary.
+
+### Sequential Execution Rationale
+
+1. Later flows may reuse flow types from earlier flows
+2. Git branches from `main` — parallel would cause conflicts
+3. One gRPC server at a time for testing
+4. User sees progress and can intervene
+
+---
+
+## Appendix A: Full Subagent Prompt Templates
+
+> **These are the verbatim, copy-paste-ready prompts** that the Per-Flow
+> Orchestrator passes to each subagent via the Task tool. Replace
+> `{{PLACEHOLDERS}}` with real values before spawning.
+>
+> Each template is self-contained — the subagent receiving it has everything it
+> needs to execute without reading this master document.
+
+---
+
+### TEMPLATE: S1 — Analysis Agent
+
 ```
+You are S1 — the Analysis Agent for a flow migration.
+
+## Target
+- Flow: {{FLOW_NAME}}
+- Primary Connector: {{CONNECTOR_NAME}}
+- Branch: {{BRANCH_NAME}}
+
+## Repos
+- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+
+## Your Job
+
+Analyze {{FLOW_NAME}} across all 3 repos by spawning 3 PARALLEL `explore`
+sub-subagents, then merge their results into a single ANALYSIS REPORT.
+
+You do NOT write code. You only read, search, and analyze.
+
+---
+
+### Sub-subagent S1.1 — Search euler-api-txns (explore, PARALLEL)
+
+Spawn with: Task(description="S1.1 euler-api-txns: {{FLOW_NAME}}", subagent_type="explore", prompt=<below>)
+
+Search /home/kanikachaudhary/Kanika/euler-api-txns/ for all implementations
+of {{FLOW_NAME}}:
+
+1. Open euler-x/src-generated/Gateway/CommonGateway.hs
+2. Find the dispatcher function that routes {{FLOW_NAME}} to per-gateway
+   implementations. Note: flow names in Haskell are camelCase (e.g.,
+   triggerOTPForWallet, verifyVpa, mandateRevoke). Search for variations.
+3. For EACH gateway that implements this flow, read its Flow.hs and document:
+
+   | Field | Value |
+   |-------|-------|
+   | Gateway name | e.g., RAZORPAY |
+   | Haskell file | e.g., euler-x/src-generated/Gateway/Razorpay/Flow.hs |
+   | Function name | e.g., razorpayVerifyVpa |
+   | Line number | e.g., :412 |
+   | HTTP method | GET / POST / PUT |
+   | Endpoint URL | Full URL or URL pattern |
+   | Auth method | Header / query param / body / basic auth |
+   | Request content type | JSON / form-encoded / XML |
+   | Request fields | Name, type, required/optional for each |
+   | Response success shape | JSON structure with field names and types |
+   | Response failure shape | Error structure |
+   | Special handling | Checksums, signatures, Base64, retries, etc. |
+
+4. Check the gateway's Endpoints.hs and Env.hs for base URLs.
+5. Check the gateway's Types.hs for request/response type definitions.
+6. Check the gateway's Transforms.hs for request construction logic.
+
+Return ALL findings as structured text. Include file:line references.
+
+---
+
+### Sub-subagent S1.2 — Search euler-api-gateway (explore, PARALLEL)
+
+Spawn with: Task(description="S1.2 euler-api-gateway: {{FLOW_NAME}}", subagent_type="explore", prompt=<below>)
+
+Search /Users/kanika.c/code/workflow/euler-api-gateway/ for implementations
+of {{FLOW_NAME}}.
+
+Some gateways exist ONLY in this repo (not in euler-api-txns):
+PINELABS_ONLINE, KOTAK_BIZ, CRED, SODEXO, YES_BIZ.
+
+1. Search gateway/src/Euler/API/Gateway/Gateway/ for {{FLOW_NAME}} (try
+   camelCase, PascalCase, snake_case, and partial matches).
+2. For each gateway found, document the same table as S1.1 (function, file,
+   line, endpoint, auth, request/response fields, special handling).
+3. Check Routes.hs and Config modules for endpoint URLs.
+
+Return ALL findings as structured text. Include file:line references.
+If nothing found, return "No implementations found in euler-api-gateway."
+
+---
+
+### Sub-subagent S1.3 — Search connector-service (explore, PARALLEL)
+
+Spawn with: Task(description="S1.3 connector-service: {{FLOW_NAME}}", subagent_type="explore", prompt=<below>)
+
+Search /home/kanikachaudhary/Kanika/connector-service/ for existing
+infrastructure related to {{FLOW_NAME}}:
+
+1. **Flow marker:** Check crates/types-traits/domain_types/src/connector_flow.rs
+   for a struct matching {{FLOW_NAME}} (PascalCase). Report YES/NO.
+
+2. **Sub-trait:** Check crates/types-traits/interfaces/src/connector_types.rs
+   for a sub-trait (e.g., {{FLOW_NAME}}V2). Report YES/NO.
+
+3. **Proto RPC:** Check crates/types-traits/grpc-api-types/proto/services.proto
+   for an RPC matching {{FLOW_NAME}}. Report YES/NO.
+
+4. **Proto messages:** Check crates/types-traits/grpc-api-types/proto/payment.proto
+   for request/response messages. Report YES/NO with message names.
+
+5. **Connector implementation:** Check
+   crates/integrations/connector-integration/src/connectors/{{CONNECTOR_NAME_LOWERCASE}}/
+   for any impl of ConnectorIntegrationV2<{{FLOW_NAME}}, ...>.
+   Report: REAL (has get_url, get_request_body, handle_response_v2) /
+   STUB (empty impl block) / MISSING.
+
+6. **Field naming map:** For each Haskell request/response field name that
+   S1.1/S1.2 would find (common ones: mobile_number, merchant_id, otp,
+   token, amount, currency, vpa, mandate_id, subscription_id, etc.),
+   grep existing .proto files and Rust domain types to find what
+   connector-service calls that concept. Build a mapping table:
+
+   | Haskell Name | connector-service Name | Found In |
+   |---|---|---|
+
+7. **FlowName enum:** Check crates/common/common_utils/src/events.rs for
+   {{FLOW_NAME}} in the FlowName enum. Report YES/NO.
+
+8. **type_id mapping:** Check crates/types-traits/ucs_interface_common/src/flow.rs
+   for a type_id entry for {{FLOW_NAME}}. Report YES/NO.
+
+Return ALL findings as structured text.
+
+---
+
+### After all 3 return, MERGE into ANALYSIS REPORT:
+
+You MUST produce this exact structure:
+
+### ANALYSIS REPORT
+
+**Flow:** {{FLOW_NAME}}
+
+**Connectors that implement this flow in Haskell:**
+| # | Gateway | Repo | File | Function | Line |
+|---|---------|------|------|----------|------|
+(from S1.1 + S1.2)
+
+**Flow type exists in connector-service:** YES / NO
+(from S1.3 — marker struct, sub-trait, proto RPC all exist = YES)
+
+**Per-Connector Analysis:**
+
+For each connector found in S1.1/S1.2:
+
+#### <ConnectorName>
+- **Source:** euler-api-txns / euler-api-gateway
+- **File:** <path>:<line>
+- **Function:** <name>
+- **Endpoint:** <method> <url>
+- **Auth:** <method>
+- **Content-Type:** <type>
+- **Request Fields:**
+  | Field | Type | Required | Notes |
+  |-------|------|----------|-------|
+- **Response (Success):**
+  | Field | Type | Notes |
+  |-------|------|-------|
+- **Response (Error):** <structure>
+- **Special Handling:** <checksums, signatures, retries, etc.>
+
+**Field Naming Map (Haskell → connector-service):**
+(from S1.3)
+| Haskell Name | connector-service Name | Found In |
+|---|---|---|
+
+**Flow Infrastructure Needed:**
+(from S1.3 — only if flow type does NOT exist)
+- [ ] Flow marker struct in connector_flow.rs
+- [ ] Domain request/response types in connector_types.rs
+- [ ] Sub-trait in interfaces/connector_types.rs
+- [ ] Proto messages in payment.proto
+- [ ] Proto RPC in services.proto
+- [ ] Proto-to-domain conversions in types.rs
+- [ ] gRPC handler in grpc-server
+- [ ] Default implementations for all connectors
+- [ ] FlowName enum variant in events.rs
+- [ ] type_id mapping in flow.rs
+
+**Pre-call Dependency Chain:**
+
+Trace what inputs {{FLOW_NAME}} needs. For each input (ID, token, reference):
+| Input Needed | Produced By Flow | That Flow Exists in UCS? | Status |
+|---|---|---|---|
+| e.g., otp_token | TriggerOtpForWallet | YES | REAL impl for {{CONNECTOR_NAME}} |
+| e.g., mandate_id | SetupMandate | YES | STUB for {{CONNECTOR_NAME}} |
+
+**Ordered execution chain:** Flow_A → Flow_B → ... → {{FLOW_NAME}}
+
+**Connector Capability for Testing:**
+Can {{CONNECTOR_NAME}} test {{FLOW_NAME}} in sandbox/preprod?
+- If YES: note any sandbox-specific behavior (synthetic values, etc.)
+- If NO or UNKNOWN: identify fallback connectors from the list above
+- Fallback connector priority: [list]
+
+---
+END ANALYSIS REPORT. Return this report as your final message.
+```
+
+---
+
+### TEMPLATE: S2 — Core Flow Infrastructure Agent
+
+```
+You are S2 — the Core Flow Infrastructure Agent.
+
+## Target
+- Flow: {{FLOW_NAME}}
+- Primary Connector: {{CONNECTOR_NAME}}
+- Branch: {{BRANCH_NAME}}
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+- Workflow docs: /home/kanikachaudhary/Kanika/flow-migration-workflow/
+
+## Context from S1
+{{PASTE FULL ANALYSIS REPORT HERE}}
+
+## Your Job
+
+Create the flow type infrastructure for {{FLOW_NAME}} (and any missing
+pre-call flow types) in connector-service. You do this by:
+1. Spawning 2 PARALLEL `explore` sub-subagents to read reference docs
+2. Spawning 1 `general` sub-subagent (S2.3) to implement
+
+---
+
+### Sub-subagent S2.1 — Read implementation guides (explore, PARALLEL)
+
+Spawn with: Task(description="S2.1 Read guides", subagent_type="explore", prompt=<below>)
+
+Read these files and return a structured summary:
+
+1. /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
+   — This is the 7-layer guide. Summarize each layer: what file to edit,
+   what to add, exact code patterns.
+
+2. /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
+   — Summarize the per-flow implementation steps.
+
+Return the summary organized by layer number (1-7).
+
+---
+
+### Sub-subagent S2.2 — Read reference material (explore, PARALLEL)
+
+Spawn with: Task(description="S2.2 Read references", subagent_type="explore", prompt=<below>)
+
+Read these files and return a structured summary:
+
+1. /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.1_type_mapping.md
+   — Haskell-to-Rust type mappings.
+
+2. /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
+   — Code pattern translation rules, especially ResponseRouterData (2 params!).
+
+3. /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.3_file_references.md
+   — Exact file paths for each component.
+
+NOTE: The file references doc may use old backend/ paths. The repo has been
+restructured — use crates/ prefix instead:
+- backend/domain_types/ → crates/types-traits/domain_types/
+- backend/interfaces/ → crates/types-traits/interfaces/
+- backend/grpc-api-types/ → crates/types-traits/grpc-api-types/
+- backend/grpc-server/ → crates/grpc-server/grpc-server/
+- backend/connector-integration/ → crates/integrations/connector-integration/
+- backend/composite-service/ → crates/integrations/composite-service/
+
+Return: exact file paths (with crates/ prefix) for each of the 7 layers,
+naming conventions, and the ResponseRouterData 2-param rule.
+
+---
+
+### Sub-subagent S2.3 — Implement core flow infrastructure (general, SEQUENTIAL)
+
+Wait for S2.1 and S2.2 to complete, then spawn:
+Task(description="S2.3 Implement: {{FLOW_NAME}} infra", subagent_type="general", prompt=<below>)
+
+You are S2.3 — the implementation agent for core flow infrastructure.
+
+## Target
+- Flow: {{FLOW_NAME}}
+- Branch: {{BRANCH_NAME}}
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+
+## Context
+**Analysis Report:**
+{{PASTE FULL ANALYSIS REPORT}}
+
+**Implementation Guide Summary (from S2.1):**
+{{PASTE S2.1 RESULT}}
+
+**File References & Naming (from S2.2):**
+{{PASTE S2.2 RESULT}}
+
+## Your Job
+
+Create ALL flow type infrastructure for {{FLOW_NAME}} and any pre-call flow
+types that are missing (from the Analysis Report's "Flow Infrastructure
+Needed" and "Pre-call Dependency Chain" sections).
+
+### Step 1: Create branch
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+git checkout main && git pull
+git checkout -b {{BRANCH_NAME}}
+```
+
+### Step 2: Implement 7 layers for EACH missing flow type
+
+For {{FLOW_NAME}} (and each missing pre-call flow type), create:
+
+**Layer 1 — Flow marker** (crates/types-traits/domain_types/src/connector_flow.rs):
+- Add `pub struct {{FLOW_NAME}};`
+- Add variant to `FlowName` enum
+
+**Layer 2 — Domain types** (crates/types-traits/domain_types/src/connector_types.rs):
+- Add `{{FLOW_NAME}}Data` request struct with fields from Analysis Report
+- Add `{{FLOW_NAME}}ResponseData` response struct
+- Decision: Reuse `PaymentsResponseData` if flow is payment-semantic;
+  create standalone struct if different domain (wallet, OTP, mandate lifecycle)
+
+**Layer 3 — Sub-trait** (crates/types-traits/interfaces/src/connector_types.rs):
+- Add trait `{{FLOW_NAME}}V2` extending `ConnectorIntegrationV2<...>`
+- Add to `ConnectorServiceTrait` bounds
+
+**Layer 4 — Proto messages + RPC**:
+- crates/types-traits/grpc-api-types/proto/payment.proto: Add request/response messages
+- crates/types-traits/grpc-api-types/proto/services.proto: Add RPC to appropriate service
+- Use connector-service naming conventions (grep existing protos first!)
+
+**Layer 5 — Proto-to-domain conversions** (crates/types-traits/domain_types/src/types.rs):
+- ForeignTryFrom for request: proto → domain
+- ForeignTryFrom for PaymentFlowData from new request
+- generate_{{flow_name}}_response function: domain → proto
+
+**Layer 6 — gRPC handler** (crates/grpc-server/grpc-server/src/server/payments.rs or new file):
+- Use implement_connector_operation! macro in utils.rs
+- Add handler method to service impl
+- Register service in app.rs if new service
+
+**Layer 7 — Default implementations** (crates/integrations/connector-integration/src/default_implementations.rs):
+- Add default_impl_{{flow_name}}_v2! macro
+- Invoke for ALL connectors EXCEPT {{CONNECTOR_NAME}}
+
+**Also update:**
+- FlowName enum in crates/common/common_utils/src/events.rs
+- type_id mapping in crates/types-traits/ucs_interface_common/src/flow.rs
+
+### Step 3: Build and fix
+
+```bash
+cargo clippy --all-targets --all-features   # Fix ALL errors and warnings
+cargo +nightly fmt --all                     # Fix ALL formatting
+cargo build                                  # Must succeed
+```
+
+Iterate until all three pass cleanly.
+
+### Step 4: Commit
+
+```bash
+git add -A
+git commit -m "feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} flow type infrastructure"
+```
+
+## RULES — STRICTLY ENFORCED
+
+1. **connector-service naming conventions**, NOT euler-api-txns. Before adding
+   ANY new field/type: grep existing .proto files and Rust domain types. Use
+   whatever name the codebase already uses.
+
+2. **ResponseRouterData has exactly 2 type params** (Response, Self). NOT 5.
+   Check crates/integrations/connector-integration/src/types.rs line 109.
+
+3. **Response type reuse:** `PaymentsResponseData` for payment-semantic flows.
+   Standalone struct only for fundamentally different domains.
+
+4. **Do NOT write connector-specific code.** Only flow type infrastructure.
+   Connector integration is S3's job.
+
+5. **BEFORE COMMIT:** `cargo clippy --all-targets --all-features` AND
+   `cargo +nightly fmt --all` — zero errors, zero warnings.
+
+6. **Do NOT amend commits or force push.**
+
+## Return CORE FLOW REPORT
+
+Return this exact structure:
+
+### CORE FLOW REPORT
+
+**Branch:** {{BRANCH_NAME}}
+**Flow types created:** [list]
+**Pre-call flow types created:** [list] (or "None")
+**Commit SHA:** <sha>
+**Commit message:** <message>
+**Files modified:**
+| File | Change |
+|------|--------|
+**Build status:** PASS / FAIL (with error)
+**Clippy status:** PASS / FAIL (with error)
+**Fmt status:** PASS / FAIL (with changes)
+
+---
+END CORE FLOW REPORT.
+```
+
+---
+
+### TEMPLATE: S3 — Connector Integration Agent
+
+```
+You are S3 — the Connector Integration Agent.
+
+## Target
+- Flow: {{FLOW_NAME}}
+- Connector: {{CONNECTOR_NAME}}
+- Branch: {{BRANCH_NAME}}
+- Attempt: {{ATTEMPT_NUMBER}} (1 = first try, >1 = retry after test failure)
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+
+## Context from prior stages
+**Analysis Report:**
+{{PASTE FULL ANALYSIS REPORT}}
+
+**Core Flow Report:**
+{{PASTE CORE FLOW REPORT OR "Skipped — flow type already exists"}}
+
+{{IF RETRY}}
+**Previous Test Failure (from S4):**
+{{PASTE S4 TEST REPORT WITH ERROR DETAILS}}
+{{END IF}}
+
+{{IF CONNECTOR SWITCH}}
+**Connector Switch:**
+Previous connector: {{OLD_CONNECTOR}} — failed with: {{ERROR}}
+Now implementing: {{CONNECTOR_NAME}} (next in fallback list)
+{{END IF}}
+
+## Your Job
+
+Implement the {{CONNECTOR_NAME}} connector integration for {{FLOW_NAME}} by:
+1. Spawning 3 PARALLEL `explore` sub-subagents to read source code
+2. Spawning 1 `general` sub-subagent (S3.4) to implement
+
+---
+
+### Sub-subagent S3.1 — Read Haskell pre-call sources (explore, PARALLEL)
+
+Skip if Analysis Report shows no pre-call dependencies.
+
+Spawn with: Task(description="S3.1 Haskell pre-calls: {{CONNECTOR_NAME}}", subagent_type="explore", prompt=<below>)
+
+Read the Haskell source for EACH pre-call flow in the dependency chain
+for {{CONNECTOR_NAME}}.
+
+Pre-call chain from Analysis Report:
+{{PASTE PRE-CALL DEPENDENCY CHAIN}}
+
+For each pre-call flow, find the {{CONNECTOR_NAME}} implementation in:
+- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+  Path: euler-x/src-generated/Gateway/<GatewayName>/Flow.hs
+- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
+  Path: gateway/src/Euler/API/Gateway/Gateway/<GatewayName>/
+
+For each pre-call flow, document:
+| Field | Value |
+|-------|-------|
+| Flow name | |
+| File:line | |
+| Endpoint URL | Full URL including base |
+| HTTP method | |
+| Auth headers | Exact header names and how values are constructed |
+| Request content type | |
+| Request construction | How each field is built (transformations, defaults) |
+| Response parsing | How each response field is extracted |
+| Status determination | How success/failure is determined |
+| Error handling | |
+
+Return all findings as structured text.
+
+---
+
+### Sub-subagent S3.2 — Read Haskell target flow sources (explore, PARALLEL)
+
+Spawn with: Task(description="S3.2 Haskell target: {{FLOW_NAME}}/{{CONNECTOR_NAME}}", subagent_type="explore", prompt=<below>)
+
+Read the {{CONNECTOR_NAME}} implementation of {{FLOW_NAME}} in Haskell.
+
+Search in:
+- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+  Path: euler-x/src-generated/Gateway/<GatewayName>/Flow.hs
+- euler-api-gateway: /Users/kanika.c/code/workflow/euler-api-gateway/
+  Path: gateway/src/Euler/API/Gateway/Gateway/<GatewayName>/
+
+Find the implementation function and document EVERYTHING:
+
+| Field | Value |
+|-------|-------|
+| File:line | |
+| Function name | |
+| Endpoint URL | Full URL including base domain |
+| HTTP method | |
+| Auth method | How credentials are used (header, body, query) |
+| Auth header names | Exact names (e.g., X-VERIFY, Authorization) |
+| Auth value construction | How the value is built (e.g., SHA256 of payload + salt) |
+| Request content type | JSON / form-encoded / XML / raw |
+| Request encoding | Any Base64, URL-encoding, etc. |
+
+**Request fields (EVERY field):**
+| Field Name | Source | Type | Required | Construction Logic |
+|------------|--------|------|----------|--------------------|
+(How is each field value obtained? Direct from input? Computed? Default?)
+
+**Response parsing (EVERY field):**
+| Response Field | Maps To | Type | Extraction Logic |
+|----------------|---------|------|-----------------|
+(How is each field extracted from the raw response?)
+
+**Status determination:**
+- How is success determined? (HTTP code? Response field? Both?)
+- What response values map to success vs failure?
+- What are the known error codes and their meanings?
+
+**Special handling:**
+- Checksum/signature algorithm (step by step if present)
+- Base64 encoding/decoding steps
+- Multi-step flows (if response triggers another call)
+- Retry logic
+- Timeout configuration
+
+Return all findings as structured text. Include EXACT file:line references.
+
+---
+
+### Sub-subagent S3.3 — Read existing connector code (explore, PARALLEL)
+
+Spawn with: Task(description="S3.3 UCS connector: {{CONNECTOR_NAME}}", subagent_type="explore", prompt=<below>)
+
+Read the existing {{CONNECTOR_NAME}} connector module in connector-service:
+/home/kanikachaudhary/Kanika/connector-service/crates/integrations/connector-integration/src/connectors/{{CONNECTOR_NAME_LOWERCASE}}/
+
+1. Read mod.rs — document:
+   - How get_url() constructs URLs (base_url, secondary_base_url usage)
+   - How get_headers() builds auth headers
+   - How get_content_type() is set
+   - How get_request_body() transforms domain → connector request
+   - How handle_response_v2() parses connector → domain response
+   - Pattern for error handling (get_error_response)
+
+2. Read transformers.rs — document:
+   - Request type definitions (what fields exist)
+   - Response type definitions
+   - TryFrom implementations (domain → connector, connector → domain)
+   - How ResponseRouterData is used (should be 2 type params)
+
+3. Check which flows already have REAL implementations vs empty stubs:
+   - For each flow in the pre-call chain, check if it has a real
+     ConnectorIntegrationV2 impl (with actual get_url, get_request_body,
+     handle_response_v2 methods) or an empty stub (impl block with no methods)
+   - Report: REAL / STUB / MISSING for each
+
+4. Find these macros and document what's registered:
+   - create_all_prerequisites! macro invocation
+   - macro_connector_implementation! macro invocation
+
+Return all findings as structured text.
+
+---
+
+### Sub-subagent S3.4 — Implement connector integration (general, SEQUENTIAL)
+
+Wait for S3.1, S3.2, S3.3 to complete, then spawn:
+Task(description="S3.4 Implement: {{FLOW_NAME}}/{{CONNECTOR_NAME}}", subagent_type="general", prompt=<below>)
+
+You are S3.4 — the connector implementation agent.
+
+## Target
+- Flow: {{FLOW_NAME}}
+- Connector: {{CONNECTOR_NAME}}
+- Branch: {{BRANCH_NAME}}
+- Attempt: {{ATTEMPT_NUMBER}}
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+
+## Context
+
+**Analysis Report:**
+{{PASTE FULL ANALYSIS REPORT}}
+
+**Core Flow Report:**
+{{PASTE CORE FLOW REPORT}}
+
+**Haskell Pre-call Sources (from S3.1):**
+{{PASTE S3.1 RESULT OR "No pre-calls needed"}}
+
+**Haskell Target Flow Sources (from S3.2):**
+{{PASTE S3.2 RESULT}}
+
+**Existing Connector Patterns (from S3.3):**
+{{PASTE S3.3 RESULT}}
+
+{{IF RETRY}}
+**Previous Test Failure — YOU MUST FIX THIS:**
+{{PASTE S4 TEST REPORT}}
+
+Root cause from S4: {{ROOT_CAUSE}}
+Suggested fix from S4: {{SUGGESTED_FIX}}
+{{END IF}}
+
+## ╔══════════════════════════════════════════════════════════════╗
+## ║  MANDATORY PRE-CALL GATE — READ THIS BEFORE WRITING CODE   ║
+## ╚══════════════════════════════════════════════════════════════╝
+
+Before writing ANY code for {{FLOW_NAME}}, verify ALL pre-call dependencies
+have REAL connector implementations in connector-service for {{CONNECTOR_NAME}}.
+
+Check the "Pre-call Dependency Chain" from the Analysis Report and the
+"existing flow status" from S3.3:
+
+- If a pre-call flow has a REAL implementation → OK, proceed
+- If a pre-call flow has a STUB (empty impl) → IMPLEMENT IT FIRST
+- If a pre-call flow is MISSING entirely → IMPLEMENT IT FIRST
+  (S2 should have created the flow type infra; you create the connector impl)
+
+NEVER plan to "use dummy values for testing later". Every pre-call must be
+a working, real integration that produces real output when called via grpcurl.
+
+## Implementation Steps
+
+### Step 1: Implement pre-call connector integrations (if needed)
+
+For each pre-call flow that is STUB or MISSING for {{CONNECTOR_NAME}}:
+
+1. In mod.rs: Add `impl ConnectorIntegrationV2<PreCallFlow, ...>` with:
+   - get_url() — from Haskell Endpoints.hs (S3.1 data)
+   - get_headers() — from Haskell Flow.hs auth pattern (S3.1 data)
+   - get_content_type() — from Haskell request encoding (S3.1 data)
+   - get_request_body() — transform domain request → connector request
+   - handle_response_v2() — parse connector response → domain response
+
+2. In transformers.rs: Add:
+   - Connector request struct + TryFrom<domain → connector>
+   - Connector response struct + TryFrom<connector → domain>
+   - Use ResponseRouterData with 2 type params
+
+3. Register in create_all_prerequisites! and macro_connector_implementation!
+
+4. Remove {{CONNECTOR_NAME}} from the default_impl macro for this flow
+   (in default_implementations.rs)
+
+### Step 2: Implement target flow connector integration
+
+Same pattern as Step 1, but for {{FLOW_NAME}}:
+
+1. **mod.rs** — Add ConnectorIntegrationV2 impl:
+   - get_url(): Construct from base_url or secondary_base_url + endpoint path
+     (from S3.2 Haskell endpoint data). Match the existing connector's URL
+     pattern from S3.3.
+   - get_headers(): Build auth headers exactly as Haskell does (from S3.2).
+     Follow existing header patterns from S3.3.
+   - get_content_type(): Match Haskell's request encoding
+   - get_request_body(): Transform domain → connector request
+   - handle_response_v2(): Parse connector → domain response
+     Map response statuses: Haskell success criteria → AttemptStatus enum
+
+2. **transformers.rs** — Add types and conversions:
+   - Connector-specific request struct with serde attributes matching the
+     connector's external API field names (use #[serde(rename = "...")])
+   - Connector-specific response struct
+   - TryFrom<domain → connector request>: map every field per S3.2 logic
+   - TryFrom<connector response → domain>: map every field, determine status
+
+3. **Register** in create_all_prerequisites! and macro_connector_implementation!
+
+4. **Remove** {{CONNECTOR_NAME}} from default_impl macro for {{FLOW_NAME}}
+   in default_implementations.rs
+
+### Step 3: Config updates (if needed)
+
+If the connector needs new config fields (e.g., secondary_base_url):
+- Update crates/types-traits/domain_types/src/router_data.rs (ConnectorSpecificConfig)
+- Update config/development.toml, config/sandbox.toml, config/production.toml
+- Update crates/internal/field-probe/src/auth.rs if ConnectorSpecificConfig changed
+
+### Step 4: Build and fix
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo clippy --all-targets --all-features   # Fix ALL errors and warnings
+cargo +nightly fmt --all                     # Fix ALL formatting
+cargo build                                  # Must succeed
+```
+
+Iterate until all three pass cleanly. Do NOT proceed with errors.
+
+### Step 5: Commit
+
+```bash
+git add -A
+git commit -m "feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} connector integration"
+```
+
+If this is a RETRY (attempt > 1):
+```bash
+git commit -m "fix({{CONNECTOR_NAME}}): fix {{FLOW_NAME}} — {{ONE_LINE_FIX_DESCRIPTION}}"
+```
+
+## RULES — STRICTLY ENFORCED
+
+1. **connector-service naming conventions**, NOT euler-api-txns. Grep existing
+   code before adding ANY new name.
+2. **ResponseRouterData has exactly 2 type params.**
+3. **Do NOT modify existing working connector code** — only ADD new code.
+4. **ZERO TOLERANCE for dummy values** — every field must map to real data.
+5. **BEFORE COMMIT:** `cargo clippy --all-targets --all-features` AND
+   `cargo +nightly fmt --all`.
+6. **Do NOT amend commits or force push.**
+7. Follow the EXISTING patterns from S3.3 for this connector. Don't invent
+   new patterns when the connector already has established conventions.
+
+## Return CONNECTOR REPORT
+
+Return this exact structure:
+
+### CONNECTOR REPORT
+
+**Connector:** {{CONNECTOR_NAME}}
+**Flow:** {{FLOW_NAME}}
+**Attempt:** {{ATTEMPT_NUMBER}}
+**Branch:** {{BRANCH_NAME}}
+
+**Pre-call implementations added/fixed:**
+| Pre-call Flow | Status Before | Status After | Files Modified |
+|---|---|---|---|
+(or "No pre-calls needed")
+
+**Target flow implementation:**
+| Component | File | Change |
+|---|---|---|
+| get_url | mod.rs | <endpoint URL used> |
+| get_headers | mod.rs | <auth pattern> |
+| get_request_body | mod.rs + transformers.rs | <field count, encoding> |
+| handle_response_v2 | mod.rs + transformers.rs | <status mapping> |
+| config | <files> | <fields added> |
+
+**Commit SHA:** <sha>
+**Commit message:** <message>
+**Files modified:** [list with change summary]
+**Build status:** PASS / FAIL
+**Clippy status:** PASS / FAIL
+**Fmt status:** PASS / FAIL
+
+{{IF RETRY}}
+**Fix applied:** <what was wrong and what was changed>
+**Root cause confirmed:** YES / NO
+{{END IF}}
+
+---
+END CONNECTOR REPORT.
+```
+
+---
+
+### TEMPLATE: S4 — Testing Agent
+
+```
+You are S4 — the Testing Agent.
+
+## Target
+- Flow: {{FLOW_NAME}}
+- Connector: {{CONNECTOR_NAME}}
+- Branch: {{BRANCH_NAME}}
+- Attempt: {{ATTEMPT_NUMBER}}
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+- Credentials: /home/kanikachaudhary/Kanika/creds.json
+- Testing guide: /home/kanikachaudhary/Kanika/flow-migration-workflow/8_testing_and_operations/8.1_testing_strategy.md
+
+## Context from prior stages
+
+**Analysis Report:**
+{{PASTE FULL ANALYSIS REPORT}}
+
+**Connector Report:**
+{{PASTE CONNECTOR REPORT}}
+
+## ╔══════════════════════════════════════════════════════════════╗
+## ║  MANDATORY PRE-TEST VALIDATION                              ║
+## ╚══════════════════════════════════════════════════════════════╝
+
+Before running ANY test, verify the Connector Report confirms:
+1. ALL pre-call dependencies have REAL implementations (not stubs)
+2. Build, clippy, and fmt all PASS
+3. The target flow's connector integration is complete
+
+If ANY of these are false, return FAIL immediately with:
+- result: FAIL
+- root_cause: "Pre-test validation failed: <specific issue>"
+- suggested_fix: "<what S3 needs to fix>"
+
+Do NOT proceed to build/test with known missing implementations.
+
+## Testing Steps (ALL sequential — no sub-subagents)
+
+### Step 1: Build the server
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build -p grpc-server
+```
+
+If build fails, return FAIL with the build error.
+
+### Step 2: Start the server
+
+```bash
+RUN_ENV=development nohup ./target/debug/grpc-server > /tmp/grpc-server.log 2>&1 &
+SERVER_PID=$!
+echo "Server PID: $SERVER_PID"
+sleep 5
+ps -p $SERVER_PID -o pid,command || { echo "FAILED TO START"; cat /tmp/grpc-server.log; }
+```
+
+If server fails to start, return FAIL with the log contents.
+
+### Step 3: Build x-connector-config header
+
+Read /home/kanikachaudhary/Kanika/creds.json and find the entry for
+{{CONNECTOR_NAME}}.
+
+Construct the header in serde JSON format:
+```
+{"config":{"<ConnectorVariant>":{<fields from creds.json>}}}
+```
+
+Rules:
+- Variant name is PascalCase and matches the Rust enum variant EXACTLY
+  (e.g., Phonepe, Razorpay, Payu, Cashfree, Paytm)
+- Secret<String> fields are plain strings (NOT {"value":"..."})
+- The outer key is always "config"
+
+To find the exact variant name:
+```bash
+grep -n "ConnectorSpecificConfig" crates/types-traits/domain_types/src/router_data.rs | head -20
+```
+
+### Step 4: Verify endpoint URLs
+
+Cross-reference the URL your implementation uses against the Haskell source:
+
+1. From the Analysis Report, note the Haskell endpoint URL
+2. From the Connector Report, note the URL in get_url()
+3. Verify the base URL in config/development.toml matches the connector's
+   preprod/sandbox domain
+4. If config/development.toml needs a temporary URL change for testing:
+   - Record the ORIGINAL value
+   - Make the change
+   - Note it in the test report (S5 will revert it)
+
+### Step 5: Execute pre-call dependency chain
+
+For each pre-call flow in the dependency chain (from Analysis Report),
+execute in order:
+
+```bash
+grpcurl -plaintext \
+  -H 'x-connector-config: <JSON from Step 3>' \
+  -H 'x-merchant-id: <merchant_id from creds>' \
+  -H 'x-tenant-id: default' \
+  -H 'x-request-id: test_precall_{{FLOW_NAME}}_<N>' \
+  -H 'x-connector-request-reference-id: test_ref_precall_<N>' \
+  -d '<request body in protobuf JSON format>' \
+  localhost:8000 types.<ServiceName>/<PreCallRpcName>
+```
+
+For each pre-call:
+- Record the FULL command and FULL response
+- Extract output IDs/tokens needed by the next call
+- If a pre-call fails, this is a FAIL for the entire test
+
+**Protobuf JSON rules:**
+- SecretString fields use `{"value":"..."}` format (this is proto, not serde)
+- Enum fields are string names
+- Standard protobuf JSON encoding
+
+### Step 6: Test the target flow
+
+Using real outputs from Step 5 as inputs:
+
+```bash
+grpcurl -plaintext \
+  -H 'x-connector-config: <JSON from Step 3>' \
+  -H 'x-merchant-id: <merchant_id from creds>' \
+  -H 'x-tenant-id: default' \
+  -H 'x-request-id: test_{{FLOW_NAME}}_{{ATTEMPT_NUMBER}}' \
+  -H 'x-connector-request-reference-id: test_ref_{{FLOW_NAME}}_{{ATTEMPT_NUMBER}}' \
+  -d '<request body using real pre-call outputs>' \
+  localhost:8000 types.<ServiceName>/{{FLOW_NAME}}
+```
+
+Record the FULL command and FULL response (including rawConnectorRequest,
+rawConnectorResponse, all fields).
+
+### Step 7: Evaluate response
+
+Evaluate the response against these criteria:
+
+**PASS** — ALL of the following:
+- HTTP 200 from gRPC (no gRPC error code)
+- The connector returned a well-formed response
+- Business data is present and correct (e.g., status, IDs, tokens)
+- rawConnectorRequest shows correct URL, headers, body
+- rawConnectorResponse shows the connector processed the request
+- Note: Sandbox may return synthetic values (e.g., PhonePe returns
+  "MERCHANT123", "OTP6789") — this is expected and counts as PASS
+
+**CAPABILITY_MISMATCH** — The connector explicitly says this feature is not
+available in test/sandbox:
+- Response contains "not supported", "not enabled", "recurring not supported",
+  "feature not available in test mode", or similar
+- The request DID reach the connector's business logic (not a routing/auth error)
+- This is an environment limitation, NOT a code bug
+- Action: The Per-Flow Orchestrator will switch to the next connector
+
+**FAIL** — Any other result:
+- gRPC error (unknown service, proto mismatch) → registration bug
+- "Api Mapping Not Found" or routing error → WRONG URL
+- Invalid merchant / credential error → wrong config format or bad creds
+- Connection error → code bug (panic, timeout, parse failure)
+- 4xx/5xx that indicates our request was malformed → code bug
+- Any non-200 where pre-calls were available but skipped → INVALID test
+- Any non-200 where dummy values were used → INVALID test
+
+For FAIL, you MUST diagnose the root cause:
+1. Check rawConnectorRequest — is the URL correct? Headers correct? Body well-formed?
+2. Check rawConnectorResponse — what did the connector say?
+3. Compare against Haskell source (from Analysis Report) — what's different?
+4. Provide a specific, actionable fix suggestion
+
+### Step 8: Record test-only config changes
+
+List any changes made to config files for testing:
+| File | Field | Original Value | Test Value | Must Revert |
+|------|-------|---------------|------------|-------------|
+
+### Step 9: Stop the server
+
+```bash
+kill $(pgrep -f grpc-server) 2>/dev/null || true
+```
+
+## Return TEST REPORT
+
+Return this exact structure:
+
+### TEST REPORT
+
+**Flow:** {{FLOW_NAME}}
+**Connector:** {{CONNECTOR_NAME}}
+**Attempt:** {{ATTEMPT_NUMBER}}
+**Branch:** {{BRANCH_NAME}}
+
+**Result:** PASS / FAIL / CAPABILITY_MISMATCH
+
+**Pre-call Chain Execution:**
+| # | Flow | RPC | Command | Response (summary) | Output Captured |
+|---|------|-----|---------|--------------------|-----------------|
+(or "No pre-calls needed")
+
+**Target Flow Test:**
+
+**grpcurl command:**
+```bash
+<full command with all headers and body>
+```
+
+**Full response JSON:**
+```json
+<COMPLETE untruncated response>
+```
+
+**HTTP status:** <status>
+
+{{IF PASS}}
+**Validation:**
+- URL correct: YES
+- Headers correct: YES
+- Request body correct: YES
+- Response parsed correctly: YES
+- Business data present: YES
+- Sandbox synthetic values: <list any, or "None">
+{{END IF}}
+
+{{IF FAIL}}
+**Root Cause Diagnosis:**
+- Symptom: <what went wrong>
+- rawConnectorRequest URL: <URL used>
+- rawConnectorRequest shows: <summary>
+- rawConnectorResponse shows: <summary>
+- Haskell comparison: <what's different>
+- Root cause: <specific diagnosis>
+- Suggested fix: <actionable fix for S3>
+{{END IF}}
+
+{{IF CAPABILITY_MISMATCH}}
+**Capability Error:**
+- Connector response: <exact error message>
+- This is an environment limitation, not a code bug
+- Recommendation: Try next connector from analysis report
+{{END IF}}
+
+**Test-only Config Changes:**
+| File | Field | Original | Test Value | Reverted? |
+|------|-------|----------|------------|-----------|
+(or "None")
+
+**Server Log Excerpts:** <any relevant errors from /tmp/grpc-server.log>
+
+---
+END TEST REPORT.
+```
+
+---
+
+### TEMPLATE: S5 — Push & PR Agent
+
+```
+You are S5 — the Push & PR Agent.
+
+## Target
+- Flow: {{FLOW_NAME}}
+- Connector: {{CONNECTOR_NAME}}
+- Branch: {{BRANCH_NAME}}
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+- Git remote: git@github.com:juspay/connector-service.git
+
+## Context from prior stages
+
+**Connector Report:**
+{{PASTE CONNECTOR REPORT}}
+
+**Test Report:**
+{{PASTE TEST REPORT}}
+
+## Your Job
+
+Finalize the branch, push, and create a pull request. This is sequential —
+no sub-subagents needed.
+
+### Step 1: Revert test-only config changes
+
+Check the Test Report's "Test-only Config Changes" section.
+
+For each change that was NOT reverted:
+```bash
+# Check current state
+git diff config/
+
+# Revert test-only changes
+git checkout config/development.toml    # or whichever file
+```
+
+If there were no test-only config changes, skip this step.
+
+### Step 2: Final pre-commit checks
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo clippy --all-targets --all-features
+cargo +nightly fmt --all
+```
+
+If either produces changes or errors, fix them and commit:
+```bash
+git add -A
+git commit -m "chore({{CONNECTOR_NAME}}): lint and format fixes for {{FLOW_NAME}}"
+```
+
+### Step 3: Verify commit history
+
+```bash
+git log --oneline main..HEAD
+```
+
+Expected commits (in order, newest first):
+- chore: lint/format fixes (if Step 2 produced changes)
+- feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} connector integration (from S3)
+- feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} flow type infrastructure (from S2, if applicable)
+- fix(...): ... (if there were S3 retries)
+
+Verify there are no accidental commits, no config-only commits, no
+work-in-progress commits.
+
+### Step 4: Push
+
+```bash
+git push -u origin {{BRANCH_NAME}}
+```
+
+Do NOT force push. Do NOT amend any commits.
+
+### Step 5: Create PR
+
+```bash
+gh pr create --title "feat({{CONNECTOR_NAME}}): add {{FLOW_NAME}} flow for {{CONNECTOR_NAME}}" --body "$(cat <<'PREOF'
+## Summary
+
+- Added {{FLOW_NAME}} flow type infrastructure (marker, domain types, sub-trait, proto, conversions, gRPC handler, default impls)
+- Implemented {{CONNECTOR_NAME}} connector integration for {{FLOW_NAME}} (request transformer, response transformer, URL, headers, error handling)
+{{IF PRE_CALLS}}- Implemented pre-call dependency flows: {{PRE_CALL_LIST}}{{END IF}}
+{{IF CONFIG}}- Updated config for {{CONFIG_CHANGES}}{{END IF}}
+
+## How did you test this?
+
+### gRPC smoke test against {{CONNECTOR_NAME}} preprod — PASS
+
+{{IF PRE_CALLS}}
+**Pre-call chain:**
+{{FOR EACH PRE_CALL}}
+- {{PRE_CALL_FLOW}}: Executed via grpcurl, captured {{OUTPUT_FIELD}}={{OUTPUT_VALUE}}
+{{END FOR}}
+{{ELSE}}
+**Pre-calls:** No pre-call dependencies for this flow.
+{{END IF}}
+
+**Request:**
+```bash
+grpcurl -plaintext \
+  -H 'x-connector-config: <REDACTED>' \
+  -H 'x-merchant-id: {{MERCHANT_ID}}' \
+  -H 'x-tenant-id: default' \
+  -H 'x-request-id: test_{{FLOW_NAME}}_{{ATTEMPT}}' \
+  -H 'x-connector-request-reference-id: test_ref_{{FLOW_NAME}}_{{ATTEMPT}}' \
+  -d '{{REQUEST_BODY_WITH_SECRETS_REPLACED}}' \
+  localhost:8000 types.{{SERVICE_NAME}}/{{FLOW_NAME}}
+```
+
+**Response (HTTP 200 — SUCCESS):**
+```json
+{{FULL_UNREDACTED_RESPONSE_JSON}}
+```
+
+{{IF TEST_CONFIG}}
+**Note:** During testing, `config/development.toml` had `{{FIELD}}` set to
+`{{TEST_VALUE}}` to reach the {{ENVIRONMENT}} endpoint. This has been reverted
+to the standard value before commit. To reproduce the test locally, set this
+URL in your development config.
+{{END IF}}
+PREOF
+)"
+```
+
+## ╔══════════════════════════════════════════════════════════════╗
+## ║  SECURITY RULES FOR PR DESCRIPTION                          ║
+## ╚══════════════════════════════════════════════════════════════╝
+
+**x-connector-config header:**
+- Replace the ENTIRE value with `<REDACTED>`
+- This header contains API keys, salt keys, merchant secrets
+- NEVER include any part of it in the PR
+
+**Request body (-d argument):**
+- Replace ONLY actual secrets (API keys, salt keys, auth tokens) with
+  `<PLACEHOLDER_DESCRIPTION>` (e.g., `<SALT_KEY>`, `<API_KEY>`)
+- Keep non-secret identifiers: merchant_id, phone numbers, reference IDs
+  are OK to include
+- SecretString values in protobuf JSON: replace the inner value only
+  (e.g., `{"value":"<SALT_KEY>"}`)
+
+**Response body:**
+- Include the FULL response JSON EXACTLY as returned
+- Do NOT redact ANY part of the response — reviewers need the complete
+  raw output to verify correctness
+- This includes: rawConnectorRequest, rawConnectorResponse, base64 payloads,
+  checksums, headers, field values — EVERYTHING
+
+**Examples:**
+
+CORRECT (header redacted, body secrets replaced, response intact):
+```
+-H 'x-connector-config: <REDACTED>' \
+-d '{"mobile_number":{"value":"8178392166"},"merchant_id":{"value":"JUSPAYUAT"}}' \
+```
+Response: <full JSON as-is>
+
+WRONG (response redacted — NEVER do this):
+```
+Response: { "otpToken": "<REDACTED>", ... }
+```
+
+WRONG (header partially shown — NEVER do this):
+```
+-H 'x-connector-config: {"config":{"Phonepe":{"merchant_id":"JUSPAYUAT",...}}}' \
+```
+
+### Step 6: Verify PR was created
+
+```bash
+gh pr view --json number,url,title,state
+```
+
+## Return PR REPORT
+
+Return this exact structure:
+
+### PR REPORT
+
+**PR URL:** <url>
+**PR Number:** #<number>
+**Branch:** {{BRANCH_NAME}}
+**Title:** <title>
+
+**Commits:**
+| # | SHA (short) | Message |
+|---|-------------|---------|
+(from git log --oneline main..HEAD)
+
+**Test status:** PASS (attempt {{ATTEMPT_NUMBER}})
+**Config reverted:** YES / NO / N/A
+
+**Pre-call flows included on this branch:**
+| Flow | Connector | New/Existing |
+|------|-----------|-------------|
+(or "None — no pre-calls")
+
+**Files changed:** <count>
+**Lines:** +<added> / -<removed>
+
+---
+END PR REPORT.
+```
+
+---
+
+### End of Appendix A
