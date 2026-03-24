@@ -3,8 +3,8 @@
 > **This is the master entry point.** Read this file first. It defines the execution
 > sequence and tells you which sub-document to follow at each step.
 >
-> Source: `euler-api-txns` (Haskell/PureScript) -- `/Users/kanika.c/code/workflow/euler-api-txns/`
-> Target: `connector-service` (Rust) -- `/Users/kanika.c/code/workflow/connector-service/`
+> Source: `euler-api-txns` (Haskell/PureScript) -- `/home/kanikachaudhary/Kanika/euler-api-txns/`
+> Target: `connector-service` (Rust) -- `/home/kanikachaudhary/Kanika/connector-service/`
 
 ---
 
@@ -24,6 +24,11 @@ If a connector can't support the flow in test, it auto-switches to the next conn
 You only need to specify the **flow name** (e.g., "Migrate the VerifyOtpForWallet flow") —
 the agent discovers which connectors implement it. See `agent_prompt.md` for variants:
 dry-run (analysis only), gateway-centric (multiple flows for one gateway), and batch planning.
+
+**Connector Credentials:** Preprod/sandbox credentials for all supported connectors are
+stored at `/home/kanikachaudhary/Kanika/creds.json`. The Testing subagent reads this file
+to build the `x-connector-config` header — no need to provide credentials manually for
+connectors that are listed in this file.
 
 **For humans:** Follow the steps below sequentially, using each linked document.
 

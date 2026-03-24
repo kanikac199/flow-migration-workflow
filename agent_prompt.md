@@ -13,24 +13,29 @@ When you receive a flow migration request:
 
 1. Read this file (`agent_prompt.md`) to understand the subagent pipeline.
 2. Read `1_orchestrator.md` to understand the overall workflow structure.
-3. Execute **Subagent 1 → 2 → 3 → 4 → 5** in order, passing the handoff data between them.
-4. If any subagent fails or needs user input, surface it to the user immediately.
-5. Do NOT proceed to the next subagent until the current one completes successfully.
-6. **One branch per flow (with dependency exception).** If the user requests multiple
+3. **When spawning each subagent, include its full prompt template from this file
+   as the subagent's context.** Each subagent section below contains a "Prompt
+   Template" — copy the appropriate template and fill in the `{{PLACEHOLDERS}}`
+   with the handoff data from the previous subagent. The subagent needs this
+   context to know what to do.
+4. Execute **Subagent 1 → 2 → 3 → 4 → 5** in order, passing the handoff data between them.
+5. If any subagent fails or needs user input, surface it to the user immediately.
+6. Do NOT proceed to the next subagent until the current one completes successfully.
+7. **One branch per flow (with dependency exception).** If the user requests multiple
    flows, run the full pipeline **separately for each flow**. Each flow gets its own
    fresh branch from `main`. Exception: pre-call dependency flows required for testing
    the target flow go on the SAME branch — they are prerequisites, not independent features.
-7. **Retry loop on failure.** If Subagent 4 (Testing) returns FAIL:
+8. **Retry loop on failure.** If Subagent 4 (Testing) returns FAIL:
    - Re-spawn Subagent 3 (Connector Integration) with the error details to fix the code
    - Re-spawn Subagent 4 (Testing) to retest
    - Repeat until HTTP 200 is received
-8. **Connector fallback on capability mismatch.** If Subagent 4 returns
+9. **Connector fallback on capability mismatch.** If Subagent 4 returns
    CAPABILITY_MISMATCH, pick the next connector from the analysis report's
    connector list, re-spawn Subagent 3 for the new connector, then Subagent 4.
    Subagent 2 (Core Flow) is NOT re-run — the flow type already exists.
-9. **Never stop at partial results.** The pipeline is NOT complete until a
-   connector returns HTTP 200 with valid business data, or ALL connectors from
-   the analysis report have been exhausted (escalate to user with evidence).
+10. **Never stop at partial results.** The pipeline is NOT complete until a
+    connector returns HTTP 200 with valid business data, or ALL connectors from
+    the analysis report have been exhausted (escalate to user with evidence).
 
 ---
 
@@ -140,15 +145,15 @@ You are analyzing a flow migration from euler-api-txns (Haskell) to connector-se
 ## Target Flow: {{FLOW_NAME}}
 
 ## Repos
-- euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-- connector-service: /Users/kanika.c/code/workflow/connector-service/
+- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
 
 ## Workflow Docs
-- Architecture comparison: /Users/kanika.c/code/workflow/flow-migration-workflow/2_overview/2.2_architecture_comparison.md
-- Flow inventory: /Users/kanika.c/code/workflow/flow-migration-workflow/3_planning/3.1_flow_inventory.md
-- Per-flow mapping: /Users/kanika.c/code/workflow/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
-- New flow type guide: /Users/kanika.c/code/workflow/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
-- Code pattern translation: /Users/kanika.c/code/workflow/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
+- Architecture comparison: /home/kanikachaudhary/Kanika/flow-migration-workflow/2_overview/2.2_architecture_comparison.md
+- Flow inventory: /home/kanikachaudhary/Kanika/flow-migration-workflow/3_planning/3.1_flow_inventory.md
+- Per-flow mapping: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
+- New flow type guide: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
+- Code pattern translation: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
 
 ## Tasks
 
@@ -279,15 +284,15 @@ You are creating flow type infrastructure in connector-service (Rust).
 {{PASTE FULL ANALYSIS REPORT FROM SUBAGENT 1}}
 
 ## Repos
-- euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-- connector-service: /Users/kanika.c/code/workflow/connector-service/
+- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
 
 ## Workflow Docs (read these before writing code)
-- New flow type (7-layer guide): /Users/kanika.c/code/workflow/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
-- Per-flow implementation: /Users/kanika.c/code/workflow/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
-- Type mapping reference: /Users/kanika.c/code/workflow/flow-migration-workflow/7_reference/7.1_type_mapping.md
-- Code pattern translation: /Users/kanika.c/code/workflow/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
-- File references: /Users/kanika.c/code/workflow/flow-migration-workflow/7_reference/7.3_file_references.md
+- New flow type (7-layer guide): /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
+- Per-flow implementation: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
+- Type mapping reference: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.1_type_mapping.md
+- Code pattern translation: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
+- File references: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.3_file_references.md
 
 ## Tasks
 
@@ -424,16 +429,16 @@ Now implementing: {{NEW CONNECTOR NAME}}
 (Delete this section if this is the first connector)
 
 ## Repos
-- euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-- connector-service: /Users/kanika.c/code/workflow/connector-service/
+- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
 
 ## Workflow Docs (read these before writing code)
-- New flow type (7-layer guide): /Users/kanika.c/code/workflow/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
-- Per-flow implementation: /Users/kanika.c/code/workflow/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
-- Create connector: /Users/kanika.c/code/workflow/flow-migration-workflow/4_phase1_gateway_migration/4.1_create_connector.md
-- Type mapping reference: /Users/kanika.c/code/workflow/flow-migration-workflow/7_reference/7.1_type_mapping.md
-- Code pattern translation: /Users/kanika.c/code/workflow/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
-- File references: /Users/kanika.c/code/workflow/flow-migration-workflow/7_reference/7.3_file_references.md
+- New flow type (7-layer guide): /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.5_new_flow_type.md
+- Per-flow implementation: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.3_per_flow_implementation.md
+- Create connector: /home/kanikachaudhary/Kanika/flow-migration-workflow/4_phase1_gateway_migration/4.1_create_connector.md
+- Type mapping reference: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.1_type_mapping.md
+- Code pattern translation: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.2_code_pattern_translation.md
+- File references: /home/kanikachaudhary/Kanika/flow-migration-workflow/7_reference/7.3_file_references.md
 
 ## Tasks
 
@@ -593,11 +598,11 @@ You are testing a newly implemented flow in connector-service via gRPC.
 {{PASTE CONNECTOR REPORT FROM SUBAGENT 3}}
 
 ## Repos
-- connector-service: /Users/kanika.c/code/workflow/connector-service/
-- euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
+- euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
 
 ## Workflow Docs
-- Testing strategy (§8.1.5 Smoke Test): /Users/kanika.c/code/workflow/flow-migration-workflow/8_testing_and_operations/8.1_testing_strategy.md
+- Testing strategy (§8.1.5 Smoke Test): /home/kanikachaudhary/Kanika/flow-migration-workflow/8_testing_and_operations/8.1_testing_strategy.md
 
 ## Tasks
 
@@ -625,9 +630,15 @@ Follow section 8.1.5 of the testing strategy doc precisely:
    sleep 5
    ```
 
-2. **Get connector credentials.**
-   Ask the user: "I need preprod/sandbox credentials for <CONNECTOR_NAME> to run
-   the gRPC smoke test. Please provide: <list of required fields from analysis>."
+2. **Get connector credentials from creds.json.**
+   Credentials for all supported connectors are stored at:
+   `/home/kanikachaudhary/Kanika/creds.json`
+   - Read this file and find the credentials for <CONNECTOR_NAME>
+   - Extract the fields needed for the `x-connector-config` header (e.g.,
+     api_key, api_secret, merchant_id, salt_key, salt_index — varies by connector)
+   - Build the `x-connector-config` header in serde JSON format:
+     `{"config":{"<ConnectorVariant>":{...fields...}}}`
+   - If the connector is NOT found in creds.json, THEN ask the user for credentials.
    Do NOT proceed without real credentials. Do NOT use placeholder values.
 
 3. **Verify the correct endpoint URLs BEFORE testing.**
@@ -776,10 +787,10 @@ You are finalizing and raising a PR for a newly implemented flow in connector-se
 {{PASTE TEST REPORT FROM SUBAGENT 4}}
 
 ## Repos
-- connector-service: /Users/kanika.c/code/workflow/connector-service/
+- connector-service: /home/kanikachaudhary/Kanika/connector-service/
 
 ## Workflow Docs
-- Testing strategy: /Users/kanika.c/code/workflow/flow-migration-workflow/8_testing_and_operations/8.1_testing_strategy.md
+- Testing strategy: /home/kanikachaudhary/Kanika/flow-migration-workflow/8_testing_and_operations/8.1_testing_strategy.md
 
 ## Tasks
 
@@ -1015,9 +1026,9 @@ Only run Subagent 1. Skip Subagents 2-5. Return the analysis report to the user.
 ```
 Analyze the <FlowName> flow for migration. Do NOT write any code.
 
-Workflow: /Users/kanika.c/code/workflow/flow-migration-workflow/
-euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-connector-service: /Users/kanika.c/code/workflow/connector-service/
+Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
+euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
 
 ### Gateway-Centric (Migrate Multiple Flows for One Gateway)
@@ -1027,9 +1038,9 @@ When the user specifies a gateway and a list of flows:
 ```
 Migrate flows Authorize, PSync, Capture for Razorpay to connector-service.
 
-Workflow: /Users/kanika.c/code/workflow/flow-migration-workflow/
-euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-connector-service: /Users/kanika.c/code/workflow/connector-service/
+Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
+euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
 
 The orchestrator runs Subagent 1 once (analyzing all flows for that gateway),
@@ -1041,9 +1052,9 @@ fresh branch from `main`. Each flow gets its own branch and PR.
 ```
 Plan migrations for HDFC, Paytm, Billdesk. Analysis only, no code.
 
-Workflow: /Users/kanika.c/code/workflow/flow-migration-workflow/
-euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-connector-service: /Users/kanika.c/code/workflow/connector-service/
+Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
+euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
 
 Runs Subagent 1 for each gateway. Returns a prioritized migration plan.
@@ -1056,25 +1067,25 @@ Runs Subagent 1 for each gateway. Returns a prioritized migration plan.
 ```
 Migrate the VerifyOtpForWallet flow to connector-service.
 
-Workflow: /Users/kanika.c/code/workflow/flow-migration-workflow/
-euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-connector-service: /Users/kanika.c/code/workflow/connector-service/
+Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
+euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
 
 **Analyze first, then decide:**
 ```
 Analyze the CheckBalanceForWallet flow for migration. Do NOT write any code.
 
-Workflow: /Users/kanika.c/code/workflow/flow-migration-workflow/
-euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-connector-service: /Users/kanika.c/code/workflow/connector-service/
+Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
+euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
 
 **Multiple flows for one gateway:**
 ```
 Migrate flows VerifyOtpForWallet, CheckBalanceForWallet, DebitWallet for PhonePe to connector-service.
 
-Workflow: /Users/kanika.c/code/workflow/flow-migration-workflow/
-euler-api-txns: /Users/kanika.c/code/workflow/euler-api-txns/
-connector-service: /Users/kanika.c/code/workflow/connector-service/
+Workflow: /home/kanikachaudhary/Kanika/flow-migration-workflow/
+euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
+connector-service: /home/kanikachaudhary/Kanika/connector-service/
 ```
