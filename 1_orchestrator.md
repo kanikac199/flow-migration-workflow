@@ -3,16 +3,27 @@
 > **This is the master entry point.** Read this file first. It defines the execution
 > sequence and tells you which sub-document to follow at each step.
 >
-> Source: `euler-api-txns` (Haskell/PureScript) -- `/Users/kanika.c/code/euler-api-txns/`
-> Target: `connector-service` (Rust) -- `/Users/kanika.c/code/connector-service/`
+> Source: `euler-api-txns` (Haskell/PureScript) -- `/Users/kanika.c/code/workflow/euler-api-txns/`
+> Target: `connector-service` (Rust) -- `/Users/kanika.c/code/workflow/connector-service/`
 
 ---
 
 ## How to Trigger This Workflow
 
-**For AI agents:** Copy the prompt template from [agent_prompt.md](agent_prompt.md), fill in the
-`{{PLACEHOLDERS}}` with your gateway details, and paste it as your first message to the agent.
-Variants for dry-run, batch planning, and Phase 2 are included.
+**For AI agents:** Paste one of the entry prompts from [agent_prompt.md](agent_prompt.md) into
+a new session. The agent acts as an **orchestrator** that spawns 5 subagents:
+1. **Analysis** (explore) — discover connectors, analyze Haskell code, identify pre-call dependencies, check connector capability
+2. **Core Flow Infrastructure** (general) — create flow type infrastructure (7 layers), including pre-call flow types if missing
+3. **Connector Integration** (general) — implement connector-specific code (transformers, URL, headers, auth) for target flow + pre-call dependencies
+4. **Testing** (general) — execute pre-call chain via grpcurl, test target flow, MUST get HTTP 200. On failure → retry loop (back to Subagent 3). On capability mismatch → auto-switch connector.
+5. **Push & PR** (general) — revert test-only config, push branch (commits already done by S2/S3), raise PR with full test evidence
+
+The orchestrator runs a **retry loop** between Subagents 3 and 4 until HTTP 200 is received.
+If a connector can't support the flow in test, it auto-switches to the next connector.
+
+You only need to specify the **flow name** (e.g., "Migrate the VerifyOtpForWallet flow") —
+the agent discovers which connectors implement it. See `agent_prompt.md` for variants:
+dry-run (analysis only), gateway-centric (multiple flows for one gateway), and batch planning.
 
 **For humans:** Follow the steps below sequentially, using each linked document.
 
@@ -113,10 +124,12 @@ If you already understand the architecture and just need to execute:
 | Action | Document | What You Get |
 |--------|----------|-------------|
 | Run testing strategy | [8.1_testing_strategy.md](8_testing_and_operations/8.1_testing_strategy.md) | Unit tests, shadow traffic, canary deployment |
+| gRPC smoke test | [8.1_testing_strategy.md § 8.1.5](8_testing_and_operations/8.1_testing_strategy.md) | End-to-end verification against connector preprod |
+| **Commit, push & raise PR** | [8.1_testing_strategy.md § 8.1.6](8_testing_and_operations/8.1_testing_strategy.md) | PR raised with full test evidence (HTTP 200 required) |
 | Complete validation checklist | [8.2_validation_checklist.md](8_testing_and_operations/8.2_validation_checklist.md) | Per-gateway per-flow sign-off criteria |
 | Verify rollback readiness | [8.3_rollback_plan.md](8_testing_and_operations/8.3_rollback_plan.md) | Feature flag rollback, trigger conditions |
 
-**Output:** Gateway is validated, rollback plan is ready.
+**Output:** Gateway is validated (HTTP 200 from connector), PR is raised with test evidence, rollback plan is ready.
 
 ---
 
@@ -217,4 +230,4 @@ If you already understand the architecture and just need to execute:
 
 ---
 
-*Last updated: 2026-03-20*
+*Last updated: 2026-03-24*
