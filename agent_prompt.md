@@ -134,14 +134,20 @@ Task(description="S1.2 connector-service", subagent_type="explore", prompt="..."
 ### Pseudocode
 
 ```
+completed_branches = []  # tracks {flow, connector, branch} for each completed flow
+
 for i, (flow, connector, branch) in enumerate(migration_plan):
     result = Task(
         description=f"Flow {i+1}/{len(migration_plan)}: {flow}",
         subagent_type="general",
-        prompt=build_per_flow_prompt(flow, connector, branch, i+1, len(migration_plan))
+        prompt=build_per_flow_prompt(
+            flow, connector, branch, i+1, len(migration_plan),
+            completed_branches  # ← pass prior branches so subagent knows what exists
+        )
     )
 
     if result.status == "SUCCESS":
+        completed_branches.append({"flow": flow, "connector": connector, "branch": branch})
         report(f"Flow {i+1} ({flow}): PR at {result.pr_url}")
     elif result.status == "ESCALATION":
         report(f"Flow {i+1} ({flow}): ESCALATION — {result.reason}")
@@ -175,6 +181,7 @@ report_batch_summary()
 ### What it receives:
 - Flow name, connector, branch name
 - Flow number and total count
+- Completed branches from prior flows in this batch (list of {flow, connector, branch})
 
 ### What it does:
 1. Spawns S1 (Analysis) and waits for ANALYSIS REPORT
@@ -218,6 +225,17 @@ pipeline. Each stage is a subagent you spawn via the Task tool.
 - **Branch:** {{BRANCH_NAME}}
 - **Flow Number:** {{FLOW_NUMBER}} of {{TOTAL_FLOWS}} in this batch
 
+## Prior Batch Branches (for pre-call dependencies)
+
+These branches contain completed flow implementations from earlier in this batch.
+They are NOT yet merged to main. If a pre-call dependency for your flow was
+implemented on one of these branches, do NOT re-implement it on your branch.
+Instead, pass the branch name to S3 and S4 so they can handle it correctly.
+
+{{COMPLETED_BRANCHES}}
+
+(If empty: "None — this is the first flow in the batch.")
+
 ## Repos
 - euler-api-txns: /home/kanikachaudhary/Kanika/euler-api-txns/
 - connector-service: /home/kanikachaudhary/Kanika/connector-service/
@@ -258,14 +276,25 @@ You must spawn 2 PARALLEL explore sub-subagents to search independently:
 
 **S1.2 — Search connector-service** (explore, PARALLEL):
 - Repo: /home/kanikachaudhary/Kanika/connector-service/
-- Check crates/types-traits/domain_types/src/connector_flow.rs for existing
-  flow marker struct matching {{FLOW_NAME}}
-- Check crates/types-traits/interfaces/src/connector_types.rs for sub-trait
-- Check crates/types-traits/grpc-api-types/proto/services.proto for RPC
-- For each Haskell field name found by S1.1, grep existing .proto files
-  and Rust domain types to find connector-service's name for that concept
-- Check if {{CONNECTOR_NAME}} has any existing implementation (real or stub)
-  for this flow
+- YOU MUST ACTUALLY READ EACH FILE BELOW. Do NOT guess, speculate, or
+  infer what "probably" exists. If you cannot find something, report "NOT FOUND"
+  with the exact grep/read command you ran.
+- Check crates/types-traits/domain_types/src/connector_flow.rs — READ this file
+  and grep for a struct matching {{FLOW_NAME}}. Report the exact line or "NOT FOUND".
+- Check crates/types-traits/interfaces/src/connector_types.rs — READ this file
+  and grep for a trait matching {{FLOW_NAME}}V2. Report the exact line or "NOT FOUND".
+- Check crates/types-traits/grpc-api-types/proto/services.proto — READ this file
+  and grep for an RPC matching {{FLOW_NAME}}. Report the exact line or "NOT FOUND".
+- Check crates/types-traits/grpc-api-types/proto/payment.proto — grep for request/
+  response message names related to {{FLOW_NAME}}. Report exact message names or "NOT FOUND".
+- Check crates/integrations/connector-integration/src/connectors/{{CONNECTOR_NAME_LOWERCASE}}/
+  — READ mod.rs and grep for `ConnectorIntegrationV2<{{FLOW_NAME}}`. If found, read the
+  impl block and report whether it has real methods (get_url, get_request_body,
+  handle_response_v2) or is empty. Report REAL/STUB/MISSING with file:line evidence.
+- Check crates/common/common_utils/src/events.rs — grep for {{FLOW_NAME}} in FlowName enum.
+- Check crates/types-traits/ucs_interface_common/src/flow.rs — grep for {{FLOW_NAME}} type_id.
+- For EVERY finding, include the file:line reference where you found it.
+  For EVERY "NOT FOUND", include the exact command you ran.
 
 After both sub-subagents return, MERGE their results into a single
 ANALYSIS REPORT with these exact sections:
@@ -534,8 +563,16 @@ while True:
 These rules apply at every level. Any subagent that writes code must follow them.
 
 ### Branching & Commits
-- **ONE BRANCH PER FLOW.** Fresh from `main`. Pre-call dependencies go on
-  the SAME branch (they're prerequisites, not independent features).
+- **ONE BRANCH PER FLOW.** Fresh from `main`. Each branch contains ONLY the
+  commits for that specific flow.
+- **Pre-call dependency handling (3 cases):**
+  - **Case A — Pre-call already on main:** Do nothing. It's available automatically.
+  - **Case B — Pre-call on a prior batch branch (not yet merged):** Do NOT
+    re-implement it. S3 skips it. S4 will temporarily merge that branch for
+    build+test, then `git reset --hard` after. Only the current flow's commits
+    appear on the current branch.
+  - **Case C — Pre-call truly missing (nowhere):** Implement it on the current
+    branch. This is the ONLY case where pre-call code goes on the current branch.
 - **Separate commits:** S2 commits core flow infra, S3 commits connector code.
   Never squash into one commit.
 - **BEFORE EVERY COMMIT:** `cargo clippy --all-targets --all-features` +
@@ -657,6 +694,7 @@ Replace these placeholders:
 | `{{BRANCH_NAME}}` | Migration plan |
 | `{{FLOW_NUMBER}}` | Sequential index |
 | `{{TOTAL_FLOWS}}` | Total count |
+| `{{COMPLETED_BRANCHES}}` | Accumulated list from batch orchestrator: `[{flow, connector, branch}, ...]` or "None" |
 
 All `{{PASTE ...}}` placeholders inside S1-S5 tasks are filled by the Per-Flow
 Orchestrator as it extracts handoff data between stages.
@@ -709,6 +747,18 @@ sub-subagents, then merge their results into a single ANALYSIS REPORT.
 
 You do NOT write code. You only read, search, and analyze.
 
+## CRITICAL RULES FOR ALL SUB-SUBAGENTS:
+- **READ FILES, DO NOT GUESS.** Every finding must come from actually reading
+  a file or running a grep. If a sub-subagent cannot find something, it must
+  report "NOT FOUND" with the exact search it ran.
+- **INCLUDE file:line EVIDENCE.** Every claim about what exists must include
+  the file path and line number where it was found.
+- **DO NOT HALLUCINATE.** Do not generate plausible-sounding code/struct/trait
+  names that you haven't actually seen in the codebase. Do not say "probably
+  exists" or "likely named". Either you found it or you didn't.
+- **DO NOT ASK QUESTIONS.** Read the files and return results. If something is
+  ambiguous, report what you actually found and flag the ambiguity.
+
 ---
 
 ### Sub-subagent S1.1 — Search euler-api-txns (explore, PARALLEL)
@@ -751,43 +801,135 @@ Return ALL findings as structured text. Include file:line references.
 
 Spawn with: Task(description="S1.2 connector-service: {{FLOW_NAME}}", subagent_type="explore", prompt=<below>)
 
+## ╔══════════════════════════════════════════════════════════════╗
+## ║  CRITICAL: READ FILES. DO NOT GUESS. DO NOT HALLUCINATE.    ║
+## ╚══════════════════════════════════════════════════════════════╝
+
+You MUST use the Read tool or Grep tool to actually read each file listed below.
+DO NOT speculate about what "probably" exists. DO NOT generate plausible-sounding
+content that you haven't actually read from a file. If you cannot find something,
+report "NOT FOUND" with the EXACT search command/tool call you used.
+
+Every finding MUST include `file:line` evidence (the actual line number where
+you saw it). Every "NOT FOUND" MUST include what you searched for and where.
+
 Search /home/kanikachaudhary/Kanika/connector-service/ for existing
 infrastructure related to {{FLOW_NAME}}:
 
-1. **Flow marker:** Check crates/types-traits/domain_types/src/connector_flow.rs
-   for a struct matching {{FLOW_NAME}} (PascalCase). Report YES/NO.
+**1. Flow marker struct:**
+- READ the file: crates/types-traits/domain_types/src/connector_flow.rs
+- Grep for: `{{FLOW_NAME}}` (PascalCase, e.g., VerifyOtpForWallet)
+- Report: FOUND at file:line with the exact struct definition, OR "NOT FOUND —
+  grepped for '{{FLOW_NAME}}' in connector_flow.rs, no match"
 
-2. **Sub-trait:** Check crates/types-traits/interfaces/src/connector_types.rs
-   for a sub-trait (e.g., {{FLOW_NAME}}V2). Report YES/NO.
+**2. Sub-trait:**
+- READ the file: crates/types-traits/interfaces/src/connector_types.rs
+- Grep for: `{{FLOW_NAME}}` (the trait is usually named {{FLOW_NAME}}V2)
+- Report: FOUND at file:line with exact trait signature, OR "NOT FOUND"
 
-3. **Proto RPC:** Check crates/types-traits/grpc-api-types/proto/services.proto
-   for an RPC matching {{FLOW_NAME}}. Report YES/NO.
+**3. Proto RPC:**
+- READ the file: crates/types-traits/grpc-api-types/proto/services.proto
+- Grep for: `{{FLOW_NAME}}` (RPC names are PascalCase)
+- Report: FOUND at file:line with exact RPC definition including service name,
+  OR "NOT FOUND"
 
-4. **Proto messages:** Check crates/types-traits/grpc-api-types/proto/payment.proto
-   for request/response messages. Report YES/NO with message names.
+**4. Proto messages:**
+- READ the file: crates/types-traits/grpc-api-types/proto/payment.proto
+- Grep for: request/response messages related to {{FLOW_NAME}}
+  (e.g., `{{FLOW_NAME}}Request`, `{{FLOW_NAME}}Response`, or variations)
+- Also grep for the proto message names used by the RPC (if found in step 3)
+- Report: FOUND with exact message names and field lists, OR "NOT FOUND"
 
-5. **Connector implementation:** Check
-   crates/integrations/connector-integration/src/connectors/{{CONNECTOR_NAME_LOWERCASE}}/
-   for any impl of ConnectorIntegrationV2<{{FLOW_NAME}}, ...>.
-   Report: REAL (has get_url, get_request_body, handle_response_v2) /
-   STUB (empty impl block) / MISSING.
+**5. Connector implementation for {{CONNECTOR_NAME}}:**
+- READ the directory listing:
+  crates/integrations/connector-integration/src/connectors/{{CONNECTOR_NAME_LOWERCASE}}/
+- READ mod.rs in that directory
+- Grep mod.rs for: `ConnectorIntegrationV2<{{FLOW_NAME}}`
+- If found, READ the entire impl block and classify:
+  - **REAL:** Has actual method bodies (get_url returns a URL, get_request_body
+    builds a request, handle_response_v2 parses a response)
+  - **STUB:** Impl block exists but methods are empty or unimplemented!()
+  - Include the file:line range of the impl block
+- If NOT found in mod.rs, also check other .rs files in the connector directory
+- Report: REAL at file:line-line / STUB at file:line-line / MISSING (not found
+  anywhere — include the grep commands you ran)
 
-6. **Field naming map:** For each Haskell request/response field name that
-   S1.1 would find (common ones: mobile_number, merchant_id, otp,
-   token, amount, currency, vpa, mandate_id, subscription_id, etc.),
-   grep existing .proto files and Rust domain types to find what
-   connector-service calls that concept. Build a mapping table:
+**6. Field naming map:**
+- For common payment/wallet/mandate field names, grep the proto files and
+  Rust domain types to find connector-service's naming:
+  ```
+  Fields to search for (grep each one):
+  - mobile_number / phone / phoneNumber
+  - merchant_id / merchantId
+  - otp / otpCode
+  - token / walletToken / mandateToken
+  - amount / orderAmount
+  - currency / currencyCode
+  - vpa / vpaAddress
+  - mandate_id / mandateId
+  - subscription_id / subscriptionId
+  - transaction_id / transactionId / txnId
+  - order_id / orderId
+  - customer_id / customerId
+  - wallet_id / walletId
+  ```
+- Search in: proto/*.proto files, crates/types-traits/domain_types/src/
+- Build a mapping table with file:line evidence for each match:
 
-   | Haskell Name | connector-service Name | Found In |
+  | Haskell Name | connector-service Name | Found In (file:line) |
+  |---|---|---|
+
+**7. FlowName enum:**
+- READ the file: crates/common/common_utils/src/events.rs
+- Grep for: `{{FLOW_NAME}}`
+- Report: FOUND at file:line with the exact enum variant, OR "NOT FOUND"
+
+**8. type_id mapping:**
+- READ the file: crates/types-traits/ucs_interface_common/src/flow.rs
+- Grep for: `{{FLOW_NAME}}`
+- Report: FOUND at file:line with the exact mapping, OR "NOT FOUND"
+
+**9. Default implementations:**
+- READ the file: crates/integrations/connector-integration/src/default_implementations.rs
+- Grep for: `{{FLOW_NAME}}`
+- Report: FOUND at file:line (shows which connectors use default/stub), OR "NOT FOUND"
+
+## MANDATORY: Your return message MUST follow this structure:
+
+```
+### S1.2 Results: {{FLOW_NAME}} in connector-service
+
+1. Flow marker struct: FOUND at <file:line> / NOT FOUND
+   Evidence: <exact line content or grep command>
+
+2. Sub-trait: FOUND at <file:line> / NOT FOUND
+   Evidence: <exact line content or grep command>
+
+3. Proto RPC: FOUND at <file:line> / NOT FOUND
+   Evidence: <exact line content or grep command>
+
+4. Proto messages: FOUND (<list>) / NOT FOUND
+   Evidence: <exact message definitions or grep command>
+
+5. Connector implementation ({{CONNECTOR_NAME}}): REAL / STUB / MISSING
+   Evidence: <file:line range, method summary, or grep command>
+
+6. Field naming map:
+   | Haskell Name | connector-service Name | Found In (file:line) |
    |---|---|---|
 
-7. **FlowName enum:** Check crates/common/common_utils/src/events.rs for
-   {{FLOW_NAME}} in the FlowName enum. Report YES/NO.
+7. FlowName enum: FOUND at <file:line> / NOT FOUND
+   Evidence: <exact line content or grep command>
 
-8. **type_id mapping:** Check crates/types-traits/ucs_interface_common/src/flow.rs
-   for a type_id entry for {{FLOW_NAME}}. Report YES/NO.
+8. type_id mapping: FOUND at <file:line> / NOT FOUND
+   Evidence: <exact line content or grep command>
 
-Return ALL findings as structured text.
+9. Default implementations: FOUND at <file:line> / NOT FOUND
+   Evidence: <exact line content or grep command>
+```
+
+DO NOT return anything else. DO NOT ask questions. DO NOT speculate.
+Read the files, report what you found with evidence, and return.
 
 ---
 
@@ -1262,6 +1404,9 @@ You are S3.4 — the connector implementation agent.
 **Existing Connector Patterns (from S3.3):**
 {{PASTE S3.3 RESULT}}
 
+**Prior Batch Branches (from orchestrator):**
+{{COMPLETED_BRANCHES}}
+
 {{IF RETRY}}
 **Previous Test Failure — YOU MUST FIX THIS:**
 {{PASTE S4 TEST REPORT}}
@@ -1274,25 +1419,43 @@ Suggested fix from S4: {{SUGGESTED_FIX}}
 ## ║  MANDATORY PRE-CALL GATE — READ THIS BEFORE WRITING CODE   ║
 ## ╚══════════════════════════════════════════════════════════════╝
 
-Before writing ANY code for {{FLOW_NAME}}, verify ALL pre-call dependencies
-have REAL connector implementations in connector-service for {{CONNECTOR_NAME}}.
+Before writing ANY code for {{FLOW_NAME}}, classify EVERY pre-call dependency
+from the Analysis Report into one of three cases:
 
-Check the "Pre-call Dependency Chain" from the Analysis Report and the
-"existing flow status" from S3.3:
+Check the "Pre-call Dependency Chain" from the Analysis Report, the
+"existing flow status" from S3.3, AND the "Prior Batch Branches" list:
 
-- If a pre-call flow has a REAL implementation → OK, proceed
-- If a pre-call flow has a STUB (empty impl) → IMPLEMENT IT FIRST
-- If a pre-call flow is MISSING entirely → IMPLEMENT IT FIRST
-  (S2 should have created the flow type infra; you create the connector impl)
+**Case A — Pre-call already on main (has REAL impl in S3.3 results):**
+  → Do nothing. It's available on your branch automatically.
+
+**Case B — Pre-call implemented by a prior flow in this batch:**
+  → Check {{COMPLETED_BRANCHES}} for a matching flow+connector.
+  → Do NOT re-implement it. Do NOT cherry-pick or merge that branch.
+  → Record the branch name in your Connector Report so S4 can temporarily
+    merge it for testing.
+  → The pre-call code does NOT go on this branch.
+
+**Case C — Pre-call is STUB or MISSING and NOT on any prior batch branch:**
+  → This is the ONLY case where you implement the pre-call on this branch.
+  → Implement it fully (mod.rs + transformers.rs + registration).
 
 NEVER plan to "use dummy values for testing later". Every pre-call must be
 a working, real integration that produces real output when called via grpcurl.
 
+Log your classification for EACH pre-call dependency in the Connector Report:
+```
+Pre-call: <FlowName> — Case <A/B/C>
+  Reason: <on main / on branch feat/xxx / truly missing>
+  Action: <skip / record branch for S4 / implement>
+```
+
 ## Implementation Steps
 
-### Step 1: Implement pre-call connector integrations (if needed)
+### Step 1: Implement pre-call connector integrations (Case C only)
 
-For each pre-call flow that is STUB or MISSING for {{CONNECTOR_NAME}}:
+For each pre-call classified as **Case C** (truly missing) for {{CONNECTOR_NAME}}:
+
+**Skip this step entirely if all pre-calls are Case A or Case B.**
 
 1. In mod.rs: Add `impl ConnectorIntegrationV2<PreCallFlow, ...>` with:
    - get_url() — from Haskell Endpoints.hs (S3.1 data)
@@ -1446,12 +1609,18 @@ You are S4 — the Testing Agent.
 **Connector Report:**
 {{PASTE CONNECTOR REPORT}}
 
+**Prior Batch Branches (from orchestrator):**
+{{COMPLETED_BRANCHES}}
+
 ## ╔══════════════════════════════════════════════════════════════╗
 ## ║  MANDATORY PRE-TEST VALIDATION                              ║
 ## ╚══════════════════════════════════════════════════════════════╝
 
 Before running ANY test, verify the Connector Report confirms:
-1. ALL pre-call dependencies have REAL implementations (not stubs)
+1. ALL pre-call dependencies are accounted for:
+   - Case A (on main): available automatically
+   - Case B (on prior batch branch): you will temporarily merge in Step 0
+   - Case C (implemented on this branch): already here
 2. Build, clippy, and fmt all PASS
 3. The target flow's connector integration is complete
 
@@ -1463,6 +1632,35 @@ If ANY of these are false, return FAIL immediately with:
 Do NOT proceed to build/test with known missing implementations.
 
 ## Testing Steps (ALL sequential — no sub-subagents)
+
+### Step 0: Temporarily incorporate prior batch branches (Case B only)
+
+Check the Connector Report for any pre-call dependencies classified as Case B
+(on a prior batch branch, not yet merged to main).
+
+If there are Case B pre-calls:
+
+```bash
+# Record current HEAD so we can reset later
+CLEAN_HEAD=$(git rev-parse HEAD)
+
+# For each Case B pre-call branch:
+git merge --no-ff --no-edit <prior_branch_name>
+# Example: git merge --no-ff --no-edit feat/phonepe-trigger-otp
+```
+
+Record which branches were merged. You MUST undo this at the end of testing
+(after Step 9) regardless of whether tests pass or fail:
+
+```bash
+# After ALL testing is complete (pass or fail):
+git reset --hard $CLEAN_HEAD
+```
+
+**CRITICAL:** This temporary merge is ONLY for build+test. The merged code
+must NOT appear in the final branch. Step 9 (cleanup) will verify this.
+
+If there are no Case B pre-calls, skip this step entirely.
 
 ### Step 1: Build the server
 
@@ -1506,18 +1704,50 @@ To find the exact variant name:
 grep -n "ConnectorSpecificConfig" crates/types-traits/domain_types/src/router_data.rs | head -20
 ```
 
-### Step 4: Verify endpoint URLs
+### Step 4: HARD GUARDRAIL — Verify endpoints against Haskell source
 
-Cross-reference the URL your implementation uses against the Haskell source:
+## ╔══════════════════════════════════════════════════════════════╗
+## ║  DO NOT SKIP THIS STEP. DO NOT PROCEED WITHOUT IT.          ║
+## ╚══════════════════════════════════════════════════════════════╝
 
-1. From the Analysis Report, note the Haskell endpoint URL
-2. From the Connector Report, note the URL in get_url()
-3. Verify the base URL in config/development.toml matches the connector's
-   preprod/sandbox domain
-4. If config/development.toml needs a temporary URL change for testing:
-   - Record the ORIGINAL value
-   - Make the change
-   - Note it in the test report (S5 will revert it)
+Before making ANY grpcurl call, you MUST cross-reference EVERY endpoint
+(pre-calls AND target flow) against the Haskell codebase.
+
+**For each flow you will test (pre-calls + target):**
+
+1. **Read the Haskell endpoint directly** — do NOT rely on the Analysis Report alone.
+   Open the actual Haskell source file and find the endpoint URL:
+   ```bash
+   # Example for PhonePe:
+   grep -n "url\|endpoint\|baseUrl\|path" /home/kanikachaudhary/Kanika/euler-api-txns/euler-x/src-generated/Gateway/<GatewayName>/Endpoints.hs | head -30
+   grep -n "url\|endpoint\|path" /home/kanikachaudhary/Kanika/euler-api-txns/euler-x/src-generated/Gateway/<GatewayName>/Flow.hs | head -30
+   ```
+
+2. **Read the connector-service get_url()** for the same flow:
+   ```bash
+   grep -A 10 "fn get_url" /home/kanikachaudhary/Kanika/connector-service/crates/integrations/connector-integration/src/connectors/<connector>/mod.rs
+   ```
+
+3. **Compare:**
+   - Does the PATH match? (e.g., `/apis/hermes/v3/merchant/otp/send` vs `/apis/pg/v1/otp/send`)
+   - Does the base URL in config/development.toml match the connector's preprod/sandbox domain?
+   - Are there environment-specific URL patterns? (UAT vs preprod vs sandbox)
+
+4. **Record the comparison in a table:**
+   ```
+   | Flow | Haskell Endpoint (file:line) | UCS get_url() (file:line) | Base URL (config) | MATCH? |
+   |------|----------------------------|--------------------------|-------------------|--------|
+   ```
+
+5. **If endpoints DON'T match:**
+   - Fix get_url() in the connector code, rebuild, and re-commit BEFORE testing
+   - Or if the base URL in config is wrong, update config/development.toml temporarily
+
+6. **If base URL seems wrong for the test environment:**
+   - Check if Haskell uses a different preprod URL than what's in config
+   - Try the Haskell preprod URL temporarily
+
+**DO NOT proceed to Step 5 until EVERY endpoint is verified and matches.**
 
 ### Step 5: Execute pre-call dependency chain
 
@@ -1576,28 +1806,88 @@ Evaluate the response against these criteria:
 - Note: Sandbox may return synthetic values (e.g., PhonePe returns
   "MERCHANT123", "OTP6789") — this is expected and counts as PASS
 
-**CAPABILITY_MISMATCH** — The connector explicitly says this feature is not
-available in test/sandbox:
-- Response contains "not supported", "not enabled", "recurring not supported",
-  "feature not available in test mode", or similar
+**CAPABILITY_MISMATCH** — VERY NARROW definition, ALL of these must be true:
+- The connector explicitly says this feature is NOT SUPPORTED or NOT AVAILABLE
+  (e.g., "recurring not supported", "feature not available in test mode",
+  "subscription APIs not enabled for this merchant")
+- The endpoint URL is VERIFIED CORRECT (matches Haskell exactly — from Step 4)
+- The credentials are VERIFIED CORRECT (same merchant/keys as other working flows)
 - The request DID reach the connector's business logic (not a routing/auth error)
-- This is an environment limitation, NOT a code bug
-- Action: The Per-Flow Orchestrator will switch to the next connector
+- You have ALREADY attempted the fixes in Step 7a below and none worked
+- This is an inherent environment limitation, NOT fixable by changing URL/creds/body
 
-**FAIL** — Any other result:
+**FAIL** — ANY of these:
 - gRPC error (unknown service, proto mismatch) → registration bug
-- "Api Mapping Not Found" or routing error → WRONG URL
-- Invalid merchant / credential error → wrong config format or bad creds
+- **"Api Mapping Not Found"** → WRONG ENDPOINT or WRONG MERCHANT CONFIGURATION.
+  This is NEVER acceptable as a pass. It means either:
+  (a) The URL path is wrong (compare against Haskell source EXACTLY), or
+  (b) The merchant credentials don't have this API enabled, or
+  (c) The preprod/sandbox base URL is wrong
+- **"Bad Request"** from connector → malformed request body, wrong encoding,
+  missing required fields — compare field-by-field against Haskell
+- **"Invalid merchant" / "Authentication failed" / credential errors** →
+  wrong config format, wrong keys, or wrong merchant ID
 - Connection error → code bug (panic, timeout, parse failure)
 - 4xx/5xx that indicates our request was malformed → code bug
 - Any non-200 where pre-calls were available but skipped → INVALID test
 - Any non-200 where dummy values were used → INVALID test
 
-For FAIL, you MUST diagnose the root cause:
-1. Check rawConnectorRequest — is the URL correct? Headers correct? Body well-formed?
-2. Check rawConnectorResponse — what did the connector say?
-3. Compare against Haskell source (from Analysis Report) — what's different?
-4. Provide a specific, actionable fix suggestion
+### Step 7a: MANDATORY fix attempts before returning FAIL
+
+If Step 7 result is FAIL, you MUST attempt fixes before returning to the
+orchestrator. DO NOT return FAIL after the first attempt without trying these:
+
+**Fix attempt checklist (try ALL applicable, in order):**
+
+1. **Endpoint mismatch fix:** Re-read the Haskell source (not the Analysis Report —
+   the ACTUAL file). Compare the full URL path character-by-character against
+   what rawConnectorRequest shows. If different:
+   - Fix get_url() in the connector code
+   - Rebuild: `cargo build -p grpc-server`
+   - Restart server and re-test
+   - Record: "Fix attempt 1: Changed endpoint from X to Y"
+
+2. **Base URL fix:** Check if the connector's base_url in config/development.toml
+   is correct for the test environment. Compare against what Haskell uses for
+   preprod/UAT. If different:
+   - Update config/development.toml temporarily
+   - Restart server and re-test
+   - Record: "Fix attempt 2: Changed base_url from X to Y"
+
+3. **Credential fix:** If the error suggests merchant/auth issues:
+   - Re-read /home/kanikachaudhary/Kanika/creds.json
+   - Verify the variant name matches EXACTLY (e.g., "Phonepe" not "PhonePe")
+   - Verify all required fields are present and correctly formatted
+   - Check if there are MULTIPLE credential entries (different merchants) —
+     try each one
+   - Record: "Fix attempt 3: Changed creds from X to Y"
+
+4. **Request body fix:** If the error suggests malformed request:
+   - Compare every field name and type against the Haskell request builder
+   - Check encoding (JSON vs form-encoded)
+   - Check required vs optional fields
+   - Fix transformers.rs if needed, rebuild, re-test
+   - Record: "Fix attempt 4: Fixed request body field X"
+
+5. **Alternative endpoint paths:** Some connectors have multiple URL patterns
+   for the same logical operation (v1 vs v2 vs v3, different path prefixes).
+   Check the Haskell source for ANY alternate paths. Try each one.
+
+**Only after exhausting ALL applicable fixes above**, return FAIL with the
+full diagnosis. The test report must include what fixes were attempted:
+
+```
+Fix Attempts:
+| # | What was tried | Result |
+|---|---------------|--------|
+| 1 | Changed endpoint path to /v2/... | Still 400 |
+| 2 | Changed base_url to preprod.example.com | Still 400 |
+| 3 | Tried alternate merchant creds | Still auth error |
+```
+
+If NONE of the fixes work and the error is clearly "this API is not enabled
+for this merchant in the test environment" (NOT a code bug), then and ONLY
+then classify as CAPABILITY_MISMATCH instead of FAIL.
 
 ### Step 8: Record test-only config changes
 
@@ -1611,6 +1901,20 @@ List any changes made to config files for testing:
 kill $(pgrep -f grpc-server) 2>/dev/null || true
 ```
 
+### Step 10: Undo temporary merges from Step 0
+
+If you merged any prior batch branches in Step 0, undo them NOW:
+
+```bash
+# Reset to the clean HEAD recorded in Step 0
+git reset --hard $CLEAN_HEAD
+```
+
+Verify the branch is clean — `git log --oneline main..HEAD` should show
+ONLY commits belonging to {{FLOW_NAME}}, with no commits from other flows.
+
+If you did NOT merge any branches in Step 0, skip this step.
+
 ## Return TEST REPORT
 
 Return this exact structure:
@@ -1623,6 +1927,10 @@ Return this exact structure:
 **Branch:** {{BRANCH_NAME}}
 
 **Result:** PASS / FAIL / CAPABILITY_MISMATCH
+
+**Temporary Branch Merges (Step 0):**
+- Branches merged: [list, or "None"]
+- Reset completed: YES / NO
 
 **Pre-call Chain Execution:**
 | # | Flow | RPC | Command | Response (summary) | Output Captured |
@@ -1644,8 +1952,12 @@ Return this exact structure:
 **HTTP status:** <status>
 
 {{IF PASS}}
+**Endpoint Verification (Step 4):**
+| Flow | Haskell Endpoint (file:line) | UCS get_url() (file:line) | Base URL (config) | MATCH? |
+|------|----------------------------|--------------------------|-------------------|--------|
+
 **Validation:**
-- URL correct: YES
+- URL correct: YES (verified against Haskell in Step 4)
 - Headers correct: YES
 - Request body correct: YES
 - Response parsed correctly: YES
@@ -1654,6 +1966,10 @@ Return this exact structure:
 {{END IF}}
 
 {{IF FAIL}}
+**Endpoint Verification (Step 4):**
+| Flow | Haskell Endpoint (file:line) | UCS get_url() (file:line) | Base URL (config) | MATCH? |
+|------|----------------------------|--------------------------|-------------------|--------|
+
 **Root Cause Diagnosis:**
 - Symptom: <what went wrong>
 - rawConnectorRequest URL: <URL used>
@@ -1662,11 +1978,20 @@ Return this exact structure:
 - Haskell comparison: <what's different>
 - Root cause: <specific diagnosis>
 - Suggested fix: <actionable fix for S3>
+
+**Fix Attempts (Step 7a):**
+| # | What was tried | Result |
+|---|---------------|--------|
+| 1 | <description> | <outcome> |
+(Must have at least 1 entry. If no fixes were applicable, explain why.)
 {{END IF}}
 
 {{IF CAPABILITY_MISMATCH}}
 **Capability Error:**
 - Connector response: <exact error message>
+- Endpoint verified correct: YES (must be YES to classify as CAPABILITY_MISMATCH)
+- Credentials verified correct: YES (must be YES)
+- Fix attempts exhausted: YES (must be YES — list attempts from Step 7a)
 - This is an environment limitation, not a code bug
 - Recommendation: Try next connector from analysis report
 {{END IF}}
@@ -1752,6 +2077,12 @@ Expected commits (in order, newest first):
 
 Verify there are no accidental commits, no config-only commits, no
 work-in-progress commits.
+
+**CRITICAL: Verify NO commits from other flows' branches are present.**
+Every commit in `git log --oneline main..HEAD` must belong to THIS flow
+({{FLOW_NAME}}). If you see commits mentioning other flow names (e.g.,
+from a temporary merge that wasn't properly reset), STOP and report the
+contamination — do NOT push. This would mean S4's Step 10 cleanup failed.
 
 ### Step 4: Push
 
